@@ -1,0 +1,215 @@
+#!/usr/bin/env python3
+"""
+ncat - Display data from Z1 cluster node memory
+
+Unix-style utility to read and display node memory contents.
+"""
+
+import sys
+import os
+import argparse
+import re
+import struct
+
+# Add lib directory to path
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'lib'))
+
+from z1_client import Z1Client, Z1ClusterError
+
+
+# Named memory locations (RP2350 PSRAM @ 0x00000000, 16MB)
+# Updated Dec 11, 2025 for RP2350 hardware (same as ncp)
+MEMORY_LOCATIONS = {
+    'neurons': 0x00100000,      # 1MB offset - neuron table (Z1_SNN_NEURON_TABLE_ADDR)
+    'weights': 0x00200000,      # 2MB offset - weight matrices
+    'code': 0x00300000,         # 3MB offset - executable code
+    'data': 0x00400000,         # 4MB offset - general data
+    'scratch': 0x00F00000,      # 15MB offset - scratch space
+}
+
+
+def parse_source(source: str) -> tuple:
+    """
+    Parse source string.
+    
+    Formats:
+      node_id/name        -> (node_id, named_location, default_length)
+      node_id@0xADDRESS   -> (node_id, address, default_length)
+    
+    Returns:
+        (node_id, address, default_length)
+    """
+    # Try node@address format
+    match = re.match(r'^(\d+)@(0x[0-9a-fA-F]+|[0-9]+)$', source)
+    if match:
+        node_id = int(match.group(1))
+        addr_str = match.group(2)
+        addr = int(addr_str, 0)
+        return (node_id, addr, 256)  # Default 256 bytes
+    
+    # Try node/name format
+    match = re.match(r'^(\d+)/(\w+)$', source)
+    if match:
+        node_id = int(match.group(1))
+        name = match.group(2)
+        if name not in MEMORY_LOCATIONS:
+            raise ValueError(f"Unknown memory location '{name}'")
+        return (node_id, MEMORY_LOCATIONS[name], 1024)  # Default 1KB
+    
+    raise ValueError(f"Invalid source format '{source}'")
+
+
+def hexdump(data: bytes, base_addr: int = 0):
+    """Print hexdump of data."""
+    for i in range(0, len(data), 16):
+        # Address
+        print(f"{base_addr + i:08x}  ", end='')
+        
+        # Hex bytes
+        chunk = data[i:i+16]
+        for j in range(16):
+            if j < len(chunk):
+                print(f"{chunk[j]:02x} ", end='')
+            else:
+                print("   ", end='')
+            if j == 7:
+                print(" ", end='')
+        
+        print(" |", end='')
+        
+        # ASCII
+        for byte in chunk:
+            if 32 <= byte <= 126:
+                print(chr(byte), end='')
+            else:
+                print('.', end='')
+        
+        print("|")
+
+
+def parse_neuron_table(data: bytes, base_addr: int):
+    """Parse and display neuron table entries."""
+    entry_size = 256
+    num_entries = len(data) // entry_size
+    
+    print(f"Neuron Table at 0x{base_addr:08X} ({num_entries} entries)")
+    print("=" * 80)
+    
+    for i in range(num_entries):
+        offset = i * entry_size
+        entry_data = data[offset:offset+entry_size]
+        
+        if len(entry_data) < 32:
+            break
+        
+        # Parse neuron state (first 32 bytes)
+        neuron_id, flags, membrane_potential, threshold, last_spike_time, \
+        synapse_count, synapse_capacity, synapse_table_offset = \
+            struct.unpack('<HHffIHHI', entry_data[:24])
+        
+        print(f"\nNeuron {neuron_id} (Entry {i}):")
+        print(f"  Flags:              0x{flags:04X}")
+        print(f"  Membrane Potential: {membrane_potential:.4f}")
+        print(f"  Threshold:          {threshold:.4f}")
+        print(f"  Last Spike:         {last_spike_time} μs")
+        print(f"  Synapses:           {synapse_count}/{synapse_capacity}")
+        print(f"  Synapse Table:      0x{synapse_table_offset:08X}")
+        
+        # Parse first few synapses
+        if synapse_count > 0:
+            print(f"  First Synapses:")
+            synapse_offset = 32  # After header
+            for j in range(min(synapse_count, 5)):
+                synapse_data = struct.unpack('<I', entry_data[synapse_offset:synapse_offset+4])[0]
+                source_neuron = (synapse_data >> 8) & 0xFFFFFF
+                weight = synapse_data & 0xFF
+                print(f"    [{j}] Source: {source_neuron}, Weight: {weight}")
+                synapse_offset += 4
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description='Display data from Z1 cluster node memory',
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  ncat 0/weights         Display weights table
+  ncat 0/weights -x      Hex dump
+  ncat 0@0x20000000      Display from specific address
+  ncat 0/neurons -n      Parse as neuron table
+  ncat 0/data -l 512     Display 512 bytes
+        """
+    )
+    
+    parser.add_argument('source',
+                       help='Source (node_id/location or node_id@address)')
+    parser.add_argument('-c', '--controller',
+                       default=None,
+                       help='Controller IP address (overrides environment/config)')
+    parser.add_argument('-x', '--hex',
+                       action='store_true',
+                       help='Hexadecimal dump')
+    parser.add_argument('-b', '--binary',
+                       action='store_true',
+                       help='Binary output to stdout')
+    parser.add_argument('-n', '--neurons',
+                       action='store_true',
+                       help='Parse as neuron table')
+    parser.add_argument('-l', '--length',
+                       type=int,
+                       help='Number of bytes to read')
+    
+    args = parser.parse_args()
+    
+    try:
+        # Parse source
+        node_id, addr, default_length = parse_source(args.source)
+        
+        if node_id < 0 or node_id > 15:
+            print("Error: Node ID must be 0-15", file=sys.stderr)
+            return 1
+        
+        # Determine length
+        length = args.length if args.length else default_length
+        if args.neurons and not args.length:
+            length = 256 * 10  # Default to 10 neuron entries
+        
+        # Connect to cluster
+        client = Z1Client(controller_ip=args.controller)
+        
+        # Read data
+        data = client.read_memory(node_id, addr, length)
+        
+        # Display based on format
+        if args.binary:
+            # Binary output to stdout
+            sys.stdout.buffer.write(data)
+        elif args.neurons:
+            # Parse as neuron table
+            parse_neuron_table(data, addr)
+        elif args.hex:
+            # Hex dump
+            hexdump(data, addr)
+        else:
+            # Try to display as text, fall back to hex
+            try:
+                text = data.decode('utf-8')
+                print(text)
+            except UnicodeDecodeError:
+                hexdump(data, addr)
+        
+        return 0
+        
+    except ValueError as e:
+        print(f"Error: {e}", file=sys.stderr)
+        return 1
+    except Z1ClusterError as e:
+        print(f"Error: {e}", file=sys.stderr)
+        return 1
+    except KeyboardInterrupt:
+        print("\nInterrupted", file=sys.stderr)
+        return 130
+
+
+if __name__ == '__main__':
+    sys.exit(main())

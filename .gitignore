@@ -1,0 +1,46 @@
+# Build directories - contain generated files with system-specific paths
+build/
+build_backup/
+
+# Firmware binaries (optional - can commit final releases)
+# Uncomment the following lines if you don't want to commit compiled binaries
+# FirmwareReleases/
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+
+# Virtual environments
+venv/
+env/
+ENV/
+
+# IDE and editor files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS files
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Temporary files
+*.tmp
+*.bak
+*.log
+
+# ELF, BIN, HEX, MAP, DIS files (intermediate build artifacts)
+*.elf
+*.bin
+*.hex
+*.map
+*.dis
+
+# Keep UF2 files in FirmwareReleases directory
+!FirmwareReleases/**/*.uf2

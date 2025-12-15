@@ -1,0 +1,229 @@
+#!/usr/bin/env python3
+"""
+nconfig - Manage Z1 cluster configuration
+
+Unix-style utility to manage multi-backplane cluster configurations.
+"""
+
+import sys
+import os
+import argparse
+import json
+
+# Add lib directory to path
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'lib'))
+
+from cluster_config import ClusterConfig, BackplaneConfig, create_default_config
+
+
+def cmd_init(args):
+    """Initialize a new cluster configuration."""
+    if os.path.exists(args.output) and not args.force:
+        print(f"Error: Configuration file already exists: {args.output}", 
+              file=sys.stderr)
+        print("Use --force to overwrite", file=sys.stderr)
+        return 1
+    
+    create_default_config(args.output)
+    print(f"Created cluster configuration: {args.output}")
+    return 0
+
+
+def cmd_list(args):
+    """List all configured backplanes."""
+    config = ClusterConfig(args.config)
+    
+    if len(config) == 0:
+        print("No backplanes configured")
+        return 0
+    
+    if args.json:
+        output = {
+            'backplanes': [
+                {
+                    'name': bp.name,
+                    'controller_ip': bp.controller_ip,
+                    'controller_port': bp.controller_port,
+                    'node_count': bp.node_count,
+                    'description': bp.description
+                }
+                for bp in config.backplanes
+            ],
+            'total_backplanes': len(config),
+            'total_nodes': config.get_total_nodes()
+        }
+        print(json.dumps(output, indent=2))
+    else:
+        print(f"Cluster Configuration: {config.config_file or '(default)'}")
+        print("=" * 80)
+        print(f"{'NAME':<20} {'CONTROLLER IP':<16} {'NODES':<6} DESCRIPTION")
+        print("-" * 80)
+        
+        for bp in config.backplanes:
+            print(f"{bp.name:<20} {bp.controller_ip:<16} {bp.node_count:<6} {bp.description}")
+        
+        print()
+        print(f"Total: {len(config)} backplane(s), {config.get_total_nodes()} nodes")
+    
+    return 0
+
+
+def cmd_add(args):
+    """Add a backplane to the configuration."""
+    config = ClusterConfig(args.config)
+    
+    # Check if backplane already exists
+    if config.get_backplane(args.name):
+        print(f"Error: Backplane '{args.name}' already exists", file=sys.stderr)
+        return 1
+    
+    # Add new backplane
+    backplane = BackplaneConfig(
+        name=args.name,
+        controller_ip=args.ip,
+        controller_port=args.port,
+        node_count=args.nodes,
+        description=args.description or ""
+    )
+    
+    config.add_backplane(backplane)
+    
+    # Save configuration
+    output_file = args.config or os.path.expanduser('~/.neurofab/cluster.json')
+    config.save(output_file)
+    
+    print(f"Added backplane '{args.name}' to {output_file}")
+    return 0
+
+
+def cmd_remove(args):
+    """Remove a backplane from the configuration."""
+    config = ClusterConfig(args.config)
+    
+    if not config.get_backplane(args.name):
+        print(f"Error: Backplane '{args.name}' not found", file=sys.stderr)
+        return 1
+    
+    config.remove_backplane(args.name)
+    
+    # Save configuration
+    output_file = args.config or os.path.expanduser('~/.neurofab/cluster.json')
+    config.save(output_file)
+    
+    print(f"Removed backplane '{args.name}' from {output_file}")
+    return 0
+
+
+def cmd_show(args):
+    """Show details of a specific backplane."""
+    config = ClusterConfig(args.config)
+    
+    bp = config.get_backplane(args.name)
+    if not bp:
+        print(f"Error: Backplane '{args.name}' not found", file=sys.stderr)
+        return 1
+    
+    if args.json:
+        output = {
+            'name': bp.name,
+            'controller_ip': bp.controller_ip,
+            'controller_port': bp.controller_port,
+            'node_count': bp.node_count,
+            'description': bp.description
+        }
+        print(json.dumps(output, indent=2))
+    else:
+        print(f"Backplane: {bp.name}")
+        print("=" * 60)
+        print(f"  Controller IP:   {bp.controller_ip}")
+        print(f"  Controller Port: {bp.controller_port}")
+        print(f"  Node Count:      {bp.node_count}")
+        print(f"  Description:     {bp.description}")
+    
+    return 0
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description='Manage Z1 cluster configuration',
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Commands:
+  init              Initialize new cluster configuration
+  list              List all configured backplanes
+  add               Add a backplane to configuration
+  remove            Remove a backplane from configuration
+  show              Show details of a specific backplane
+
+Examples:
+  nconfig init                                  Create default config
+  nconfig list                                  List all backplanes
+  nconfig add bp-0 192.168.1.222               Add backplane
+  nconfig add bp-1 192.168.1.223 --nodes 16    Add with node count
+  nconfig remove bp-0                          Remove backplane
+  nconfig show bp-0                            Show backplane details
+        """
+    )
+    
+    parser.add_argument('--config',
+                       help='Cluster configuration file')
+    parser.add_argument('-j', '--json',
+                       action='store_true',
+                       help='Output in JSON format')
+    
+    subparsers = parser.add_subparsers(dest='command', help='Command to execute')
+    
+    # Init command
+    parser_init = subparsers.add_parser('init', help='Initialize new configuration')
+    parser_init.add_argument('-o', '--output',
+                            default='cluster.json',
+                            help='Output file (default: cluster.json)')
+    parser_init.add_argument('-f', '--force',
+                            action='store_true',
+                            help='Overwrite existing file')
+    
+    # List command
+    parser_list = subparsers.add_parser('list', help='List all backplanes')
+    
+    # Add command
+    parser_add = subparsers.add_parser('add', help='Add a backplane')
+    parser_add.add_argument('name', help='Backplane name')
+    parser_add.add_argument('ip', help='Controller IP address')
+    parser_add.add_argument('--port', type=int, default=80,
+                           help='Controller port (default: 80)')
+    parser_add.add_argument('--nodes', type=int, default=16,
+                           help='Number of nodes (default: 16)')
+    parser_add.add_argument('--description', help='Description')
+    
+    # Remove command
+    parser_remove = subparsers.add_parser('remove', help='Remove a backplane')
+    parser_remove.add_argument('name', help='Backplane name')
+    
+    # Show command
+    parser_show = subparsers.add_parser('show', help='Show backplane details')
+    parser_show.add_argument('name', help='Backplane name')
+    
+    args = parser.parse_args()
+    
+    if not args.command:
+        parser.print_help()
+        return 1
+    
+    try:
+        if args.command == 'init':
+            return cmd_init(args)
+        elif args.command == 'list':
+            return cmd_list(args)
+        elif args.command == 'add':
+            return cmd_add(args)
+        elif args.command == 'remove':
+            return cmd_remove(args)
+        elif args.command == 'show':
+            return cmd_show(args)
+    except Exception as e:
+        print(f"Error: {e}", file=sys.stderr)
+        return 1
+
+
+if __name__ == '__main__':
+    sys.exit(main())

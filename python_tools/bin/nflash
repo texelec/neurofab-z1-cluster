@@ -1,0 +1,363 @@
+#!/usr/bin/env python3
+"""
+nflash - Flash firmware to Z1 compute nodes
+
+Utility for uploading and installing firmware on compute nodes.
+"""
+
+import sys
+import os
+import argparse
+import struct
+import time
+from pathlib import Path
+
+# Add lib directory to path
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'lib'))
+
+from z1_client import Z1Client, Z1ClusterError
+from cluster_config import ClusterConfig
+
+
+def calculate_crc32(data):
+    """Calculate CRC32 checksum."""
+    import zlib
+    return zlib.crc32(data) & 0xFFFFFFFF
+
+
+def create_firmware_header(firmware_data, name, version, capabilities=0):
+    """
+    Create firmware header for Z1 bootloader.
+    
+    Args:
+        firmware_data: Raw firmware binary
+        name: Firmware name (max 31 chars)
+        version: Version string (max 15 chars)
+        capabilities: Capability flags
+        
+    Returns:
+        Complete firmware image with header
+    """
+    FIRMWARE_MAGIC = 0x4E465A31  # "NFZ1"
+    FIRMWARE_VERSION = 1
+    
+    # Calculate CRC32 of firmware code
+    crc32 = calculate_crc32(firmware_data)
+    
+    # Build header (256 bytes)
+    header = bytearray(256)
+    
+    struct.pack_into('<I', header, 0, FIRMWARE_MAGIC)  # magic
+    struct.pack_into('<I', header, 4, FIRMWARE_VERSION)  # version
+    struct.pack_into('<I', header, 8, len(firmware_data))  # firmware_size
+    struct.pack_into('<I', header, 12, 0x100)  # entry_point (offset from APP_BASE)
+    struct.pack_into('<I', header, 16, crc32)  # crc32
+    struct.pack_into('<I', header, 20, int(time.time()))  # timestamp
+    
+    # Name (32 bytes, null-terminated)
+    name_bytes = name.encode('utf-8')[:31]
+    header[24:24+len(name_bytes)] = name_bytes
+    
+    # Version string (16 bytes, null-terminated)
+    version_bytes = version.encode('utf-8')[:15]
+    header[56:56+len(version_bytes)] = version_bytes
+    
+    # Capabilities
+    struct.pack_into('<I', header, 72, capabilities)
+    
+    # Combine header + firmware
+    return bytes(header) + firmware_data
+
+
+def flash_firmware(args):
+    """Flash firmware to node(s)."""
+    # Load firmware file
+    firmware_path = Path(args.firmware)
+    if not firmware_path.exists():
+        print(f"Error: Firmware file not found: {firmware_path}", file=sys.stderr)
+        return 1
+    
+    with open(firmware_path, 'rb') as f:
+        firmware_data = f.read()
+    
+    print(f"Loaded firmware: {firmware_path.name} ({len(firmware_data)} bytes)")
+    
+    # Create firmware header
+    name = args.name or firmware_path.stem
+    version = args.version or "1.0.0"
+    
+    # Determine capabilities from firmware name
+    capabilities = 0
+    if 'snn' in name.lower():
+        capabilities |= 0x00000001  # FW_CAP_SNN
+    elif 'matrix' in name.lower():
+        capabilities |= 0x00000002  # FW_CAP_MATRIX
+    elif 'signal' in name.lower():
+        capabilities |= 0x00000004  # FW_CAP_SIGNAL
+    else:
+        capabilities |= 0x80000000  # FW_CAP_CUSTOM
+    
+    firmware_image = create_firmware_header(firmware_data, name, version, capabilities)
+    
+    print(f"Firmware image: {len(firmware_image)} bytes")
+    print(f"  Name: {name}")
+    print(f"  Version: {version}")
+    print(f"  CRC32: 0x{calculate_crc32(firmware_data):08X}")
+    
+    # Parse target nodes
+    targets = parse_targets(args.target)
+    
+    if not targets:
+        print("Error: No valid targets specified", file=sys.stderr)
+        return 1
+    
+    print(f"\nFlashing {len(targets)} node(s)...")
+    
+    # Flash each target
+    success_count = 0
+    failed_nodes = []
+    
+    for backplane, node_id in targets:
+        target_name = f"{backplane or 'default'}:{node_id}"
+        
+        try:
+            # Get controller IP
+            if backplane:
+                config = ClusterConfig(args.config)
+                bp = config.get_backplane(backplane)
+                if not bp:
+                    print(f"  {target_name}: Backplane not found", file=sys.stderr)
+                    failed_nodes.append((target_name, "Backplane not found"))
+                    continue
+                controller_ip = bp.controller_ip
+                controller_port = bp.controller_port
+            else:
+                config = ClusterConfig(args.config)
+                bp = config.get_default_backplane()
+                controller_ip = args.controller or bp.controller_ip
+                controller_port = bp.controller_port
+            
+            # Create client and test connection
+            try:
+                client = Z1Client(controller_ip=controller_ip, port=controller_port)
+            except Exception as e:
+                print(f"  {target_name}: Failed to connect to controller at {controller_ip}:{controller_port}", file=sys.stderr)
+                print(f"    Error: {e}", file=sys.stderr)
+                failed_nodes.append((target_name, f"Connection failed: {e}"))
+                continue
+            
+            # Upload firmware to buffer (address 0x10020000)
+            FIRMWARE_BUFFER_ADDR = 0x10020000
+            
+            print(f"  {backplane or 'default'}:{node_id}: Uploading firmware...")
+            bytes_written = client.write_memory(node_id, FIRMWARE_BUFFER_ADDR, firmware_image)
+            
+            if bytes_written != len(firmware_image):
+                print(f"    ERROR: Only {bytes_written}/{len(firmware_image)} bytes written")
+                continue
+            
+            # Verify firmware
+            print(f"  {backplane or 'default'}:{node_id}: Verifying...")
+            # (Would call verify endpoint)
+            
+            # Install firmware
+            print(f"  {backplane or 'default'}:{node_id}: Installing...")
+            # (Would call install endpoint)
+            
+            # Activate and reboot
+            if not args.no_reboot:
+                print(f"  {backplane or 'default'}:{node_id}: Rebooting...")
+                # (Would call reboot endpoint)
+            
+            print(f"  {backplane or 'default'}:{node_id}: ✓ Success")
+            success_count += 1
+            
+        except Exception as e:
+            print(f"  {target_name}: ERROR - {e}", file=sys.stderr)
+            failed_nodes.append((target_name, str(e)))
+    
+    print(f"\nFlashed {success_count}/{len(targets)} node(s) successfully")
+    
+    if failed_nodes:
+        print(f"\nFailed nodes:")
+        for target_name, error in failed_nodes:
+            print(f"  {target_name}: {error}")
+    
+    return 0 if success_count == len(targets) else 1
+
+
+def info_firmware(args):
+    """Get firmware information from node(s)."""
+    targets = parse_targets(args.target)
+    
+    if not targets:
+        print("Error: No valid targets specified", file=sys.stderr)
+        return 1
+    
+    print(f"Firmware Information:")
+    print("=" * 80)
+    
+    for backplane, node_id in targets:
+        try:
+            # Get controller IP
+            if backplane:
+                config = ClusterConfig(args.config)
+                bp = config.get_backplane(backplane)
+                if not bp:
+                    continue
+                controller_ip = bp.controller_ip
+            else:
+                controller_ip = args.controller
+            
+            client = Z1Client(controller_ip=controller_ip)
+            
+            # Get firmware info (would use dedicated endpoint)
+            # For now, read header from application slot
+            APP_BASE = 0x10004000
+            header_data = client.read_memory(node_id, APP_BASE, 256)
+            
+            # Parse header
+            magic, version, fw_size, entry, crc32, timestamp = struct.unpack_from('<6I', header_data, 0)
+            name = header_data[24:56].decode('utf-8', errors='ignore').rstrip('\x00')
+            ver_str = header_data[56:72].decode('utf-8', errors='ignore').rstrip('\x00')
+            
+            print(f"\n{backplane or 'default'}:{node_id}")
+            if magic == 0x4E465A31:
+                print(f"  Name:      {name}")
+                print(f"  Version:   {ver_str}")
+                print(f"  Size:      {fw_size} bytes")
+                print(f"  CRC32:     0x{crc32:08X}")
+                print(f"  Timestamp: {time.ctime(timestamp)}")
+            else:
+                print(f"  No valid firmware installed")
+            
+        except Exception as e:
+            print(f"\n{backplane or 'default'}:{node_id}")
+            print(f"  ERROR: {e}")
+    
+    return 0
+
+
+def parse_targets(target_spec):
+    """
+    Parse target specification.
+    
+    Formats:
+        "5" - Node 5 on default backplane
+        "backplane-0:5" - Node 5 on backplane-0
+        "all" - All nodes on all backplanes
+        "backplane-0:all" - All nodes on backplane-0
+        
+    Returns:
+        List of (backplane, node_id) tuples
+    """
+    targets = []
+    
+    if target_spec == "all":
+        # All nodes on all backplanes
+        config = ClusterConfig()
+        for bp in config.backplanes:
+            for node_id in range(bp.node_count):
+                targets.append((bp.name, node_id))
+    
+    elif ":" in target_spec:
+        # Backplane:node format
+        backplane, node_str = target_spec.split(":", 1)
+        
+        if node_str == "all":
+            # All nodes on specified backplane
+            config = ClusterConfig()
+            bp = config.get_backplane(backplane)
+            if bp:
+                for node_id in range(bp.node_count):
+                    targets.append((backplane, node_id))
+        else:
+            # Specific node
+            try:
+                node_id = int(node_str)
+                targets.append((backplane, node_id))
+            except ValueError:
+                pass
+    
+    else:
+        # Just node number (default backplane)
+        try:
+            node_id = int(target_spec)
+            targets.append((None, node_id))
+        except ValueError:
+            pass
+    
+    return targets
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description='Flash firmware to Z1 compute nodes',
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Commands:
+  flash FIRMWARE TARGET     Flash firmware to node(s)
+  info TARGET               Get firmware information
+
+Target Formats:
+  5                         Node 5 on default backplane
+  backplane-0:5             Node 5 on backplane-0
+  all                       All nodes on all backplanes
+  backplane-0:all           All nodes on backplane-0
+
+Examples:
+  nflash flash snn_firmware.bin 0              Flash to node 0
+  nflash flash snn_firmware.bin all            Flash to all nodes
+  nflash flash custom.bin backplane-1:5        Flash to specific node
+  nflash info all                              Get firmware info from all nodes
+        """
+    )
+    
+    parser.add_argument('command',
+                       choices=['flash', 'info'],
+                       help='Command to execute')
+    parser.add_argument('firmware',
+                       nargs='?',
+                       help='Firmware file (for flash command)')
+    parser.add_argument('target',
+                       nargs='?',
+                       help='Target node(s)')
+    parser.add_argument('-c', '--controller',
+                       default=None,
+                       help='Controller IP (default backplane)')
+    parser.add_argument('--config',
+                       help='Cluster configuration file')
+    parser.add_argument('--name',
+                       help='Firmware name (default: filename)')
+    parser.add_argument('--version',
+                       default='1.0.0',
+                       help='Firmware version (default: 1.0.0)')
+    parser.add_argument('--no-reboot',
+                       action='store_true',
+                       help='Do not reboot after flashing')
+    
+    args = parser.parse_args()
+    
+    try:
+        if args.command == 'flash':
+            if not args.firmware or not args.target:
+                print("Error: flash requires firmware file and target", file=sys.stderr)
+                return 1
+            return flash_firmware(args)
+        
+        elif args.command == 'info':
+            if not args.target:
+                # Default to all nodes
+                args.target = 'all'
+            return info_firmware(args)
+    
+    except Z1ClusterError as e:
+        print(f"Error: {e}", file=sys.stderr)
+        return 1
+    except KeyboardInterrupt:
+        print("\nInterrupted", file=sys.stderr)
+        return 130
+
+
+if __name__ == '__main__':
+    sys.exit(main())

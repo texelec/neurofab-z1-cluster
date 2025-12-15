@@ -1,0 +1,262 @@
+#!/usr/bin/env python3
+"""
+nls - List Z1 cluster compute nodes
+
+Unix-style utility to list all compute nodes in the NeuroFab Z1 cluster.
+Supports multi-backplane configurations with 200+ nodes.
+"""
+
+import sys
+import os
+import argparse
+import json
+from concurrent.futures import ThreadPoolExecutor, as_completed
+
+# Add lib directory to path
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'lib'))
+
+from z1_client import Z1Client, Z1ClusterError, format_memory_size, format_uptime
+from cluster_config import ClusterConfig, BackplaneConfig
+
+
+def list_single_backplane(backplane: BackplaneConfig, verbose: bool = False):
+    """
+    List nodes from a single backplane.
+    
+    Returns:
+        Tuple of (backplane, nodes, error)
+    """
+    try:
+        client = Z1Client(controller_ip=backplane.controller_ip, 
+                         port=backplane.controller_port)
+        nodes = client.list_nodes()
+        return (backplane, nodes, None)
+    except Exception as e:
+        return (backplane, [], str(e))
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description='List all compute nodes in the Z1 cluster',
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  nls                           List all nodes from all backplanes
+  nls -v                        Verbose output with memory info
+  nls -j                        JSON output for scripting
+  nls -c 192.168.1.100          Use custom controller IP (single backplane)
+  nls --config cluster.json     Use cluster configuration file
+  nls --backplane backplane-0   List nodes from specific backplane
+  nls --all                     List all nodes from all configured backplanes
+        """
+    )
+    
+    parser.add_argument('-c', '--controller', 
+                       help='Controller IP address (single backplane mode)')
+    parser.add_argument('--config',
+                       help='Cluster configuration file')
+    parser.add_argument('--backplane',
+                       help='List nodes from specific backplane (by name)')
+    parser.add_argument('--all',
+                       action='store_true',
+                       help='List all nodes from all configured backplanes')
+    parser.add_argument('-v', '--verbose',
+                       action='store_true',
+                       help='Show detailed node information')
+    parser.add_argument('-j', '--json',
+                       action='store_true',
+                       help='Output in JSON format')
+    parser.add_argument('--parallel',
+                       action='store_true',
+                       help='Query backplanes in parallel (faster for multi-backplane)')
+    
+    args = parser.parse_args()
+    
+    try:
+        # Determine operation mode
+        if args.controller:
+            # Single backplane mode (legacy)
+            # Auto-detect port based on IP
+            port = 8000 if args.controller in ['127.0.0.1', 'localhost'] else 80
+            backplane = BackplaneConfig(
+                name="single",
+                controller_ip=args.controller,
+                controller_port=port
+            )
+            backplanes_to_query = [backplane]
+        
+        elif args.config or args.all or args.backplane:
+            # Multi-backplane mode
+            config = ClusterConfig(args.config)
+            
+            if len(config) == 0:
+                print("Error: No backplanes configured. Use --config or -c option.", 
+                      file=sys.stderr)
+                return 1
+            
+            if args.backplane:
+                # Query specific backplane
+                bp = config.get_backplane(args.backplane)
+                if not bp:
+                    print(f"Error: Backplane '{args.backplane}' not found", 
+                          file=sys.stderr)
+                    return 1
+                backplanes_to_query = [bp]
+            else:
+                # Query all backplanes
+                backplanes_to_query = list(config.backplanes)
+        
+        else:
+            # Try to load default config, fall back to single controller
+            config = ClusterConfig()
+            if len(config) > 0:
+                backplanes_to_query = list(config.backplanes)
+            else:
+                # Use smart default from cluster_config
+                backplane = config.get_default_backplane()
+                backplanes_to_query = [backplane]
+        
+        # Query backplanes
+        all_results = []
+        
+        if args.parallel and len(backplanes_to_query) > 1:
+            # Parallel query for multiple backplanes
+            with ThreadPoolExecutor(max_workers=min(10, len(backplanes_to_query))) as executor:
+                futures = {
+                    executor.submit(list_single_backplane, bp, args.verbose): bp 
+                    for bp in backplanes_to_query
+                }
+                
+                for future in as_completed(futures):
+                    result = future.result()
+                    all_results.append(result)
+        else:
+            # Sequential query
+            for bp in backplanes_to_query:
+                result = list_single_backplane(bp, args.verbose)
+                all_results.append(result)
+        
+        # Sort results by backplane name
+        all_results.sort(key=lambda x: x[0].name)
+        
+        # Output results
+        if args.json:
+            # JSON output
+            output = {
+                'backplanes': []
+            }
+            
+            total_nodes = 0
+            for backplane, nodes, error in all_results:
+                bp_data = {
+                    'name': backplane.name,
+                    'controller': backplane.controller_ip,
+                    'node_count': len(nodes),
+                    'nodes': []
+                }
+                
+                if error:
+                    bp_data['error'] = error
+                else:
+                    bp_data['nodes'] = [
+                        {
+                            'id': node.node_id,
+                            'global_id': f"{backplane.name}:{node.node_id}",
+                            'status': node.status,
+                            'memory_free': node.memory_free,
+                            'uptime_ms': node.uptime_ms,
+                            'led_state': node.led_state
+                        }
+                        for node in nodes
+                    ]
+                    total_nodes += len(nodes)
+                
+                output['backplanes'].append(bp_data)
+            
+            output['total_nodes'] = total_nodes
+            output['total_backplanes'] = len(all_results)
+            
+            print(json.dumps(output, indent=2))
+        
+        elif args.verbose:
+            # Verbose output
+            print("Z1 Cluster Nodes")
+            print("=" * 80)
+            
+            total_nodes = 0
+            for backplane, nodes, error in all_results:
+                print(f"\n{backplane.name} ({backplane.controller_ip})")
+                print("-" * 80)
+                
+                if error:
+                    print(f"  Error: {error}")
+                    continue
+                
+                print(f"  Nodes: {len(nodes)}\n")
+                
+                for node in nodes:
+                    print(f"  Node {node.node_id:2d} [{backplane.name}:{node.node_id}]:")
+                    print(f"    Status:      {node.status}")
+                    print(f"    Memory Free: {format_memory_size(node.memory_free)}")
+                    print(f"    Uptime:      {format_uptime(node.uptime_ms)}")
+                    print(f"    LED State:   R={node.led_state['r']:3d} "
+                          f"G={node.led_state['g']:3d} "
+                          f"B={node.led_state['b']:3d}")
+                    print()
+                
+                total_nodes += len(nodes)
+            
+            print("=" * 80)
+            print(f"Total: {total_nodes} nodes across {len(all_results)} backplane(s)")
+        
+        else:
+            # Standard output
+            if len(backplanes_to_query) > 1:
+                print(f"BACKPLANE        NODE  STATUS    MEMORY      UPTIME")
+                print("-" * 70)
+            else:
+                print(f"NODE  STATUS    MEMORY      UPTIME")
+                print("-" * 50)
+            
+            total_nodes = 0
+            for backplane, nodes, error in all_results:
+                if error:
+                    if len(backplanes_to_query) > 1:
+                        print(f"{backplane.name:16s} ERROR: {error}")
+                    else:
+                        print(f"ERROR: {error}")
+                    continue
+                
+                for node in nodes:
+                    if len(backplanes_to_query) > 1:
+                        print(f"{backplane.name:16s} {node.node_id:4d}  {node.status:8s}  "
+                              f"{format_memory_size(node.memory_free):10s}  "
+                              f"{format_uptime(node.uptime_ms):>10s}")
+                    else:
+                        print(f"{node.node_id:4d}  {node.status:8s}  "
+                              f"{format_memory_size(node.memory_free):10s}  "
+                              f"{format_uptime(node.uptime_ms):>10s}")
+                
+                total_nodes += len(nodes)
+            
+            print()
+            if len(backplanes_to_query) > 1:
+                print(f"Total: {total_nodes} nodes across {len(all_results)} backplane(s)")
+            else:
+                print(f"Total: {total_nodes} nodes")
+        
+        return 0
+        
+    except Z1ClusterError as e:
+        print(f"Error: {e}", file=sys.stderr)
+        return 1
+    except KeyboardInterrupt:
+        print("\nInterrupted", file=sys.stderr)
+        return 130
+    except Exception as e:
+        print(f"Error: {e}", file=sys.stderr)
+        return 1
+
+
+if __name__ == '__main__':
+    sys.exit(main())

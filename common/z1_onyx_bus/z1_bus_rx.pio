@@ -1,0 +1,71 @@
+; Z1 Onyx Bus - RX State Machine (Phase 1)
+; Receives frames with source-synchronous clock from transmitter
+;
+; Pin mapping:
+;   IN pins: BUS_DATA[15:0] (GPIO 12-27, 16 pins)
+;   WAIT GPIO: BUS_CLK (GPIO 6) - wait for clock edges  
+;
+; Operation:
+;   1. Sample beats on each rising CLK edge
+;   2. Push to RX FIFO via autopush
+;   3. C code handles frame parsing, validation, and boundary detection
+;
+; Note: Current implementation - NO SOP/EOP sync (Phase 3a complete)
+;   - PIO samples every CLK edge (no frame awareness)
+;   - C code parses frame boundaries from DMA ring buffer
+;   - Memory barrier prevents DMA race (25.7μs per rejected frame)
+;   - Sufficient for low/medium traffic (<30K spikes/sec)
+;
+; Future optimization - SOP-synchronized capture (Phase 3c, if needed):
+;   - Add: pull block, mov x, osr, wait 1 gpio 8 (SOP wait)
+;   - Add: jmp x-- loop (beat counter, auto-stop after 259 beats)
+;   - Benefit: Hardware frame sync, 0 CPU for rejected frames
+;   - See: docs/SOP_EOP_IMPLEMENTATION_ANALYSIS.md for details
+
+.program z1_bus_rx
+
+.wrap_target
+    wait 0 gpio 6           ; Wait for CLK falling (idle)
+    wait 1 gpio 6      [3]  ; Wait for CLK rising + 3 cycle delay for setup time
+    in pins, 16             ; Sample 16 bits, autopush when threshold reached
+.wrap
+
+% c-sdk {
+static inline void z1_bus_rx_program_init(PIO pio, uint sm, uint offset,
+                                           uint clk_pin, uint select0_pin, uint data_base_pin) {
+    pio_sm_config c = z1_bus_rx_program_get_default_config(offset);
+    
+    // IN pins: DATA[15:0] (16 pins)
+    sm_config_set_in_pins(&c, data_base_pin);
+    
+    // Autopush every 16 bits (one beat)
+    sm_config_set_in_shift(&c, false, true, 16);
+    
+    // Join FIFOs for deeper RX buffer (8 words)
+    sm_config_set_fifo_join(&c, PIO_FIFO_JOIN_RX);
+    
+    // RX runs at full speed (1.0) for precise sampling
+    // TX runs at 8.3125 (32 MHz), RX at 266 MHz allows fine-grained delays
+    // wait instructions are not affected by clock divider (they wait for external GPIO)
+    // [3] delay at 266 MHz = 11.28 ns (samples in middle of CLK=1 window)
+    sm_config_set_clkdiv(&c, 1.0f);
+    
+    // CRITICAL: Configure ALL pins for PIO control
+    // CLK pin MUST be under PIO control for 'wait' instructions to work!
+    pio_gpio_init(pio, clk_pin);
+    
+    // DATA pins for 'in pins' instruction
+    for (int i = 0; i < 16; i++) {
+        pio_gpio_init(pio, data_base_pin + i);
+    }
+    
+    // Set all pins as inputs (receiver never drives)
+    pio_sm_set_consecutive_pindirs(pio, sm, data_base_pin, 16, false);
+    
+    // Initialize and start state machine
+    pio_sm_init(pio, sm, offset, &c);
+    pio_sm_set_enabled(pio, sm, true);
+}
+%}
+
+

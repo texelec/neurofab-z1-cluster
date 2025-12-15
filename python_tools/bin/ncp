@@ -1,0 +1,145 @@
+#!/usr/bin/env python3
+"""
+ncp - Copy files to Z1 cluster nodes
+
+Unix-style utility to copy files to node memory.
+"""
+
+import sys
+import os
+import argparse
+import re
+
+# Add lib directory to path
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'lib'))
+
+from z1_client import Z1Client, Z1ClusterError, format_memory_size
+
+
+# Named memory locations (RP2350 PSRAM @ 0x00000000, 16MB)
+# Updated Dec 11, 2025 for RP2350 hardware
+MEMORY_LOCATIONS = {
+    'neurons': 0x00100000,      # 1MB offset - neuron table (Z1_SNN_NEURON_TABLE_ADDR)
+    'weights': 0x00200000,      # 2MB offset - weight matrices
+    'code': 0x00300000,         # 3MB offset - executable code
+    'data': 0x00400000,         # 4MB offset - general data
+    'scratch': 0x00F00000,      # 15MB offset - scratch space
+}
+
+
+def parse_destination(dest: str) -> tuple:
+    """
+    Parse destination string.
+    
+    Formats:
+      node_id/name        -> (node_id, named_location)
+      node_id@0xADDRESS   -> (node_id, address)
+    
+    Returns:
+        (node_id, address)
+    """
+    # Try node@address format
+    match = re.match(r'^(\d+)@(0x[0-9a-fA-F]+|[0-9]+)$', dest)
+    if match:
+        node_id = int(match.group(1))
+        addr_str = match.group(2)
+        addr = int(addr_str, 0)  # Auto-detect hex/decimal
+        return (node_id, addr)
+    
+    # Try node/name format
+    match = re.match(r'^(\d+)/(\w+)$', dest)
+    if match:
+        node_id = int(match.group(1))
+        name = match.group(2)
+        if name not in MEMORY_LOCATIONS:
+            raise ValueError(f"Unknown memory location '{name}'. "
+                           f"Valid locations: {', '.join(MEMORY_LOCATIONS.keys())}")
+        return (node_id, MEMORY_LOCATIONS[name])
+    
+    raise ValueError(f"Invalid destination format '{dest}'. "
+                    f"Use 'node_id/name' or 'node_id@address'")
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description='Copy files to Z1 cluster node memory',
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=f"""
+Memory Locations:
+  {', '.join(f'{k}=0x{v:08X}' for k, v in MEMORY_LOCATIONS.items())}
+
+Examples:
+  ncp weights.bin 0/weights           Copy to node 0 weights location
+  ncp firmware.bin 0@0x20000000       Copy to specific address
+  ncp data.bin 0/data -v              Copy with progress
+        """
+    )
+    
+    parser.add_argument('source',
+                       help='Local file path')
+    parser.add_argument('dest',
+                       help='Destination (node_id/location or node_id@address)')
+    parser.add_argument('-c', '--controller',
+                       default=None,
+                       help='Controller IP address (overrides environment/config)')
+    parser.add_argument('-v', '--verbose',
+                       action='store_true',
+                       help='Show progress')
+    
+    args = parser.parse_args()
+    
+    try:
+        # Parse destination
+        node_id, addr = parse_destination(args.dest)
+        
+        if node_id < 0 or node_id > 15:
+            print("Error: Node ID must be 0-15", file=sys.stderr)
+            return 1
+        
+        # Read source file
+        if not os.path.exists(args.source):
+            print(f"Error: File not found: {args.source}", file=sys.stderr)
+            return 1
+        
+        with open(args.source, 'rb') as f:
+            data = f.read()
+        
+        file_size = len(data)
+        
+        if args.verbose:
+            print(f"Copying {args.source} ({format_memory_size(file_size)}) "
+                  f"to node {node_id} at 0x{addr:08X}...")
+        
+        # Connect to cluster
+        client = Z1Client(controller_ip=args.controller)
+        
+        # Write data
+        bytes_written = client.write_memory(node_id, addr, data)
+        
+        if bytes_written != file_size:
+            print(f"Warning: Expected to write {file_size} bytes, "
+                  f"but wrote {bytes_written} bytes", file=sys.stderr)
+            return 1
+        
+        if args.verbose:
+            print(f"Successfully copied {format_memory_size(bytes_written)} "
+                  f"to node {node_id}")
+        else:
+            print(f"{args.source} -> node {node_id}:0x{addr:08X} "
+                  f"({format_memory_size(bytes_written)})")
+        
+        return 0
+        
+    except ValueError as e:
+        print(f"Error: {e}", file=sys.stderr)
+        return 1
+    except Z1ClusterError as e:
+        print(f"Error: {e}", file=sys.stderr)
+        return 1
+    except KeyboardInterrupt:
+        print("\nInterrupted", file=sys.stderr)
+        return 130
+
+
+if __name__ == '__main__':
+    sys.exit(main())

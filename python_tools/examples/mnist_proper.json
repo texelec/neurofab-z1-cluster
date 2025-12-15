@@ -1,0 +1,49 @@
+{
+  "network_name": "MNIST_Proper_SNN",
+  "description": "Proper MNIST network using Z1 emulator with real spike-based processing",
+  "neuron_count": 894,
+  "layers": [
+    {
+      "layer_id": 0,
+      "layer_type": "input",
+      "neuron_count": 784,
+      "neuron_ids": [0, 783],
+      "threshold": 0.5,
+      "leak_rate": 0.0,
+      "refractory_period_us": 1000,
+      "description": "Input layer: 28x28 = 784 pixels"
+    },
+    {
+      "layer_id": 1,
+      "layer_type": "hidden",
+      "neuron_count": 100,
+      "neuron_ids": [784, 883],
+      "threshold": 2.5,
+      "leak_rate": 0.95,
+      "refractory_period_us": 2000,
+      "description": "Hidden layer: feature extraction"
+    },
+    {
+      "layer_id": 2,
+      "layer_type": "output",
+      "neuron_count": 10,
+      "neuron_ids": [884, 893],
+      "threshold": 3.0,
+      "leak_rate": 0.90,
+      "refractory_period_us": 3000,
+      "description": "Output layer: 10 digits (0-9)"
+    }
+  ],
+  "connections": [],
+  "node_assignment": {
+    "strategy": "balanced",
+    "nodes": [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]
+  },
+  "simulation_params": {
+    "timestep_us": 1000,
+    "simulation_duration_ms": 200
+  },
+  "stdp_config": {
+    "enabled": false
+  }
+}

@@ -1,0 +1,52 @@
+{
+  "network_name": "XOR_Correct",
+  "description": "Correct XOR implementation: OR - AND = XOR",
+  "neuron_count": 5,
+  "layers": [
+    {
+      "layer_id": 0,
+      "layer_type": "input",
+      "neuron_count": 2,
+      "neuron_ids": [0, 1],
+      "threshold": 2.5,
+      "leak_rate": 0.95,
+      "refractory_period_us": 2000,
+      "description": "Input neurons A and B"
+    },
+    {
+      "layer_id": 1,
+      "layer_type": "hidden",
+      "neuron_count": 2,
+      "neuron_ids": [2, 3],
+      "threshold": 1.0,
+      "leak_rate": 0.9,
+      "refractory_period_us": 2000,
+      "description": "Neuron 2=OR gate (low threshold), Neuron 3=AND gate (high threshold)"
+    },
+    {
+      "layer_id": 2,
+      "layer_type": "output",
+      "neuron_count": 1,
+      "neuron_ids": [4],
+      "threshold": 1.5,
+      "leak_rate": 0.9,
+      "refractory_period_us": 3000,
+      "description": "Output: OR - AND = XOR"
+    }
+  ],
+  "connections": [
+    {"source_neuron": 0, "target_neuron": 2, "weight": 1.2, "delay_us": 1000, "description": "A → OR"},
+    {"source_neuron": 1, "target_neuron": 2, "weight": 1.2, "delay_us": 1000, "description": "B → OR"},
+    {"source_neuron": 0, "target_neuron": 3, "weight": 1.0, "delay_us": 1000, "description": "A → AND"},
+    {"source_neuron": 1, "target_neuron": 3, "weight": 1.0, "delay_us": 1000, "description": "B → AND"},
+    {"source_neuron": 2, "target_neuron": 4, "weight": 1.8, "delay_us": 1000, "description": "OR → Output (excitatory)"},
+    {"source_neuron": 3, "target_neuron": 4, "weight": -1.8, "delay_us": 500, "description": "AND → Output (inhibitory)"}
+  ],
+  "neuron_params": [
+    {"neuron_id": 2, "threshold": 0.8, "description": "OR gate: fires if ANY input (1.2 > 0.8)"},
+    {"neuron_id": 3, "threshold": 1.8, "description": "AND gate: fires only if BOTH inputs (2.0 > 1.8)"}
+  ],
+  "node_assignment": {"strategy": "balanced", "nodes": [0, 1]},
+  "simulation_params": {"timestep_us": 1000, "simulation_duration_ms": 100},
+  "stdp_config": {"enabled": false}
+}

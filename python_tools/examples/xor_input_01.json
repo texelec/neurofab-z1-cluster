@@ -1,0 +1,7 @@
+{
+  "description": "XOR input pattern: 0 XOR 1 = 1",
+  "spikes": [
+    {"neuron_id": 0, "value": 0.0},
+    {"neuron_id": 1, "value": 1.0}
+  ]
+}

@@ -1,0 +1,55 @@
+{
+  "network_name": "MNIST_Optimized",
+  "description": "Optimized MNIST network with lower thresholds and stronger connectivity",
+  "neuron_count": 894,
+  "layers": [
+    {
+      "layer_id": 0,
+      "layer_type": "input",
+      "neuron_count": 784,
+      "neuron_ids": [0, 783],
+      "threshold": 0.5,
+      "leak_rate": 0.0,
+      "refractory_period_us": 1000,
+      "description": "Input layer: 28x28 pixels"
+    },
+    {
+      "layer_id": 1,
+      "layer_type": "hidden",
+      "neuron_count": 100,
+      "neuron_ids": [784, 883],
+      "threshold": 2.0,
+      "leak_rate": 0.9,
+      "refractory_period_us": 2000,
+      "description": "Hidden layer with lower threshold for easier firing"
+    },
+    {
+      "layer_id": 2,
+      "layer_type": "output",
+      "neuron_count": 10,
+      "neuron_ids": [884, 893],
+      "threshold": 3.0,
+      "leak_rate": 0.85,
+      "refractory_period_us": 2000,
+      "description": "Output layer: 10 digit classes"
+    }
+  ],
+  "connections": [
+    {
+      "source_layer": 0,
+      "target_layer": 1,
+      "connection_type": "random",
+      "probability": 0.3,
+      "weight_range": [0.3, 1.5],
+      "delay_us": 1000
+    },
+    {
+      "source_layer": 1,
+      "target_layer": 2,
+      "connection_type": "random",
+      "probability": 0.8,
+      "weight_range": [0.5, 2.0],
+      "delay_us": 1000
+    }
+  ]
+}

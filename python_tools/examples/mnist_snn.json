@@ -1,0 +1,67 @@
+{
+  "network_name": "MNIST_SNN_Classifier",
+  "description": "Simple SNN for MNIST digit classification",
+  "neuron_count": 1794,
+  "layers": [
+    {
+      "layer_id": 0,
+      "layer_type": "input",
+      "neuron_count": 784,
+      "neuron_ids": [0, 783],
+      "description": "28x28 pixel input layer",
+      "threshold": 1.0,
+      "leak_rate": 0.0
+    },
+    {
+      "layer_id": 1,
+      "layer_type": "hidden",
+      "neuron_count": 1000,
+      "neuron_ids": [784, 1783],
+      "description": "Hidden layer with LIF neurons",
+      "threshold": 1.0,
+      "leak_rate": 0.95,
+      "refractory_period_us": 1000
+    },
+    {
+      "layer_id": 2,
+      "layer_type": "output",
+      "neuron_count": 10,
+      "neuron_ids": [1784, 1793],
+      "description": "Output layer (10 digits)",
+      "threshold": 1.0,
+      "leak_rate": 0.95,
+      "refractory_period_us": 2000
+    }
+  ],
+  "connections": [
+    {
+      "source_layer": 0,
+      "target_layer": 1,
+      "connection_type": "fully_connected",
+      "weight_init": "random_normal",
+      "weight_mean": 0.5,
+      "weight_stddev": 0.1,
+      "delay_us": 1000
+    },
+    {
+      "source_layer": 1,
+      "target_layer": 2,
+      "connection_type": "fully_connected",
+      "weight_init": "random_normal",
+      "weight_mean": 0.5,
+      "weight_stddev": 0.1,
+      "delay_us": 1000
+    }
+  ],
+  "node_assignment": {
+    "strategy": "balanced",
+    "nodes": [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11],
+    "neurons_per_node": 150
+  },
+  "simulation_params": {
+    "timestep_us": 1000,
+    "simulation_duration_ms": 100,
+    "input_encoding": "rate_coding",
+    "input_duration_ms": 50
+  }
+}

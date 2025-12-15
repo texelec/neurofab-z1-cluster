@@ -1,0 +1,97 @@
+{
+  "network_name": "XOR_Simple",
+  "description": "Minimal XOR implementation with 5 neurons",
+  "neuron_count": 5,
+  "layers": [
+    {
+      "layer_id": 0,
+      "layer_type": "input",
+      "neuron_count": 2,
+      "neuron_ids": [0, 1],
+      "threshold": 0.1,
+      "leak_rate": 0.0,
+      "refractory_period_us": 500,
+      "description": "Input neurons A and B"
+    },
+    {
+      "layer_id": 1,
+      "layer_type": "hidden",
+      "neuron_count": 2,
+      "neuron_ids": [2, 3],
+      "threshold": 1.5,
+      "leak_rate": 0.95,
+      "refractory_period_us": 1000,
+      "description": "Hidden layer - detects single input active"
+    },
+    {
+      "layer_id": 2,
+      "layer_type": "output",
+      "neuron_count": 1,
+      "neuron_ids": [4, 4],
+      "threshold": 1.8,
+      "leak_rate": 0.95,
+      "refractory_period_us": 2000,
+      "description": "Output neuron"
+    }
+  ],
+  "connections": [
+    {
+      "source_neuron": 0,
+      "target_neuron": 2,
+      "weight": 2.0,
+      "delay_us": 1000,
+      "description": "A excites hidden neuron 2"
+    },
+    {
+      "source_neuron": 1,
+      "target_neuron": 2,
+      "weight": 2.0,
+      "delay_us": 1000,
+      "description": "B excites hidden neuron 2"
+    },
+    {
+      "source_neuron": 0,
+      "target_neuron": 3,
+      "weight": -3.0,
+      "delay_us": 500,
+      "description": "A inhibits hidden neuron 3"
+    },
+    {
+      "source_neuron": 1,
+      "target_neuron": 3,
+      "weight": -3.0,
+      "delay_us": 500,
+      "description": "B inhibits hidden neuron 3"
+    },
+    {
+      "source_neuron": 2,
+      "target_neuron": 4,
+      "weight": 2.5,
+      "delay_us": 1000,
+      "description": "Hidden 2 excites output"
+    },
+    {
+      "source_neuron": 3,
+      "target_neuron": 4,
+      "weight": -3.0,
+      "delay_us": 500,
+      "description": "Hidden 3 inhibits output when both inputs active"
+    }
+  ],
+  "node_assignment": {
+    "strategy": "balanced",
+    "nodes": [0, 1],
+    "description": "Distribute across 2 nodes"
+  },
+  "simulation_params": {
+    "timestep_us": 1000,
+    "simulation_duration_ms": 50,
+    "input_encoding": "rate_coding"
+  },
+  "stdp_config": {
+    "enabled": true,
+    "learning_rate": 0.01,
+    "tau_plus": 20000,
+    "tau_minus": 20000
+  }
+}

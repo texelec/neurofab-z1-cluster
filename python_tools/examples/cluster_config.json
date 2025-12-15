@@ -1,0 +1,46 @@
+{
+  "backplanes": [
+    {
+      "name": "backplane-0",
+      "controller_ip": "192.168.1.222",
+      "controller_port": 80,
+      "node_count": 16,
+      "description": "Rack 1, Slot 1 - Primary backplane"
+    },
+    {
+      "name": "backplane-1",
+      "controller_ip": "192.168.1.223",
+      "controller_port": 80,
+      "node_count": 16,
+      "description": "Rack 1, Slot 2"
+    },
+    {
+      "name": "backplane-2",
+      "controller_ip": "192.168.1.224",
+      "controller_port": 80,
+      "node_count": 16,
+      "description": "Rack 1, Slot 3"
+    },
+    {
+      "name": "backplane-3",
+      "controller_ip": "192.168.1.225",
+      "controller_port": 80,
+      "node_count": 16,
+      "description": "Rack 1, Slot 4"
+    },
+    {
+      "name": "backplane-4",
+      "controller_ip": "192.168.1.226",
+      "controller_port": 80,
+      "node_count": 16,
+      "description": "Rack 2, Slot 1"
+    },
+    {
+      "name": "backplane-5",
+      "controller_ip": "192.168.1.227",
+      "controller_port": 80,
+      "node_count": 16,
+      "description": "Rack 2, Slot 2"
+    }
+  ]
+}

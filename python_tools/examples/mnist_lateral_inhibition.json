@@ -1,0 +1,63 @@
+{
+  "network_name": "MNIST_Lateral_Inhibition",
+  "description": "MNIST network with lateral inhibition in output layer to prevent winner-take-all",
+  "neuron_count": 894,
+  "layers": [
+    {
+      "layer_id": 0,
+      "layer_type": "input",
+      "neuron_count": 784,
+      "neuron_ids": [0, 783],
+      "threshold": 0.5,
+      "leak_rate": 0.0,
+      "refractory_period_us": 1000,
+      "description": "Input layer: 28x28 pixels"
+    },
+    {
+      "layer_id": 1,
+      "layer_type": "hidden",
+      "neuron_count": 100,
+      "neuron_ids": [784, 883],
+      "threshold": 1.5,
+      "leak_rate": 0.9,
+      "refractory_period_us": 2000,
+      "description": "Hidden layer with lower threshold"
+    },
+    {
+      "layer_id": 2,
+      "layer_type": "output",
+      "neuron_count": 10,
+      "neuron_ids": [884, 893],
+      "threshold": 2.5,
+      "leak_rate": 0.85,
+      "refractory_period_us": 2000,
+      "description": "Output layer with lateral inhibition"
+    }
+  ],
+  "connections": [
+    {
+      "source_layer": 0,
+      "target_layer": 1,
+      "connection_type": "random",
+      "probability": 0.35,
+      "weight_range": [0.2, 1.0],
+      "delay_us": 1000
+    },
+    {
+      "source_layer": 1,
+      "target_layer": 2,
+      "connection_type": "random",
+      "probability": 0.9,
+      "weight_range": [0.4, 1.5],
+      "delay_us": 1000
+    },
+    {
+      "source_layer": 2,
+      "target_layer": 2,
+      "connection_type": "all_to_all_inhibitory",
+      "weight_range": [-1.5, -0.5],
+      "delay_us": 500,
+      "description": "Lateral inhibition: each output neuron inhibits all others"
+    }
+  ]
+}

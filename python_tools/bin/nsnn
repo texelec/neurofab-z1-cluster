@@ -1,0 +1,493 @@
+#!/usr/bin/env python3
+"""
+nsnn - Manage Spiking Neural Networks on Z1 cluster
+
+Comprehensive SNN management utility with multi-backplane support for 200+ nodes.
+"""
+
+import sys
+import os
+import argparse
+import json
+import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
+
+# Add lib directory to path
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'lib'))
+
+from z1_client import Z1Client, Z1ClusterError
+from cluster_config import ClusterConfig
+from snn_compiler import compile_snn_topology, DeploymentPlan
+
+
+def deploy_snn(args):
+    """Deploy SNN topology to cluster."""
+    print(f"Loading topology: {args.topology}")
+    
+    # Reset neuron count tracking before new deployment
+    # This ensures the controller starts counting from zero
+    try:
+        import requests
+        controller_ip = args.controller if args.controller else '192.168.1.222'
+        print(f"Resetting neuron count on controller {controller_ip}...")
+        r = requests.post(f"http://{controller_ip}/api/snn/reset", timeout=2)
+        if r.status_code == 200:
+            print("[OK] Neuron count reset")
+        else:
+            print(f"[WARN] Reset returned status {r.status_code}")
+    except Exception as e:
+        print(f"[WARN] Reset failed: {e}")
+        pass  # Ignore if reset fails (old firmware without this endpoint)
+    
+    # Load cluster configuration if multi-backplane
+    config = None
+    if args.config or args.all:
+        config = ClusterConfig(args.config)
+        if len(config) == 0:
+            print("Error: No backplanes configured", file=sys.stderr)
+            return 1
+        
+        # Convert to backplane_config format for compiler
+        backplane_config = {
+            'backplanes': [
+                {
+                    'name': bp.name,
+                    'controller_ip': bp.controller_ip,
+                    'node_count': bp.node_count
+                }
+                for bp in config.backplanes
+            ]
+        }
+    else:
+        backplane_config = None
+    
+    # Compile topology
+    print("Compiling SNN topology...")
+    deployment_plan = compile_snn_topology(args.topology, backplane_config)
+    
+    print(f"\nDeployment Plan:")
+    print(f"  Total Neurons:  {deployment_plan.total_neurons}")
+    print(f"  Total Synapses: {deployment_plan.total_synapses}")
+    print(f"  Backplanes:     {len(deployment_plan.backplane_nodes)}")
+    print(f"  Nodes:          {len(deployment_plan.neuron_tables)}")
+    
+    # Group by backplane
+    print(f"\nDistribution:")
+    for bp_name, node_list in deployment_plan.backplane_nodes.items():
+        total_neurons_bp = sum(
+            len(deployment_plan.neuron_tables[(bp_name, nid)]) // 256
+            for nid in node_list
+        )
+        print(f"  {bp_name}: {len(node_list)} nodes, {total_neurons_bp} neurons")
+    
+    # Deploy to each backplane
+    print(f"\nDeploying neuron tables...")
+    
+    deployment_results = {}
+    
+    for bp_name, node_list in deployment_plan.backplane_nodes.items():
+        # Get controller IP for this backplane
+        if config:
+            bp = config.get_backplane(bp_name)
+            if not bp:
+                print(f"Error: Backplane '{bp_name}' not found in configuration", file=sys.stderr)
+                continue
+            controller_ip = bp.controller_ip
+            controller_port = bp.controller_port
+        else:
+            # Single-node mode: use args.controller if specified, otherwise use ClusterConfig default
+            if args.controller:
+                controller_ip = args.controller
+                # Auto-detect port based on IP
+                controller_port = 8000 if controller_ip in ['127.0.0.1', 'localhost'] else 80
+            else:
+                # Use ClusterConfig to get default (respects environment variables)
+                default_bp = config.get_default_backplane() if config else ClusterConfig().get_default_backplane()
+                controller_ip = default_bp.controller_ip
+                controller_port = default_bp.controller_port
+        
+        print(f"\n  Deploying to {bp_name} ({controller_ip}:{controller_port})...")
+        client = Z1Client(controller_ip=controller_ip, port=controller_port)
+        
+        # Deploy to each node on this backplane
+        for node_id in node_list:
+            table_data = deployment_plan.neuron_tables[(bp_name, node_id)]
+            neuron_count = len(table_data) // 256
+            
+            try:
+                # Write neuron table to node memory
+                # Address: 0x00100000 (1MB offset in PSRAM, relative to PSRAM base)
+                # NOTE: PSRAM driver accepts offsets, not absolute CPU addresses
+                addr = 0x00100000
+                bytes_written = client.write_memory(node_id, addr, table_data)
+                
+                # Load topology from PSRAM
+                client.load_topology(node_id, neuron_count)
+                
+                print(f"    Node {node_id:2d}: {neuron_count:4d} neurons ({bytes_written:6d} bytes) [OK]")
+                
+                deployment_results[(bp_name, node_id)] = {
+                    'success': True,
+                    'neurons': neuron_count,
+                    'bytes': bytes_written
+                }
+                
+            except Exception as e:
+                print(f"    Node {node_id:2d}: ERROR - {e}")
+                deployment_results[(bp_name, node_id)] = {
+                    'success': False,
+                    'error': str(e)
+                }
+    
+    # Summary
+    successful = sum(1 for r in deployment_results.values() if r.get('success'))
+    total = len(deployment_results)
+    
+    print(f"\nDeployment Summary:")
+    print(f"  Successful: {successful}/{total} nodes")
+    print(f"  Total neurons deployed: {deployment_plan.total_neurons}")
+    
+    if successful == total:
+        print(f"\n[OK] SNN deployed successfully!")
+        
+        # Save deployment info for later use
+        deployment_info_file = os.path.expanduser('~/.neurofab/last_deployment.json')
+        os.makedirs(os.path.dirname(deployment_info_file), exist_ok=True)
+        
+        # Get controller IP from first deployed backplane
+        first_bp_name = list(deployment_plan.backplane_nodes.keys())[0]
+        if backplane_config:
+            bp_info = [bp for bp in backplane_config['backplanes'] if bp['name'] == first_bp_name]
+            controller_ip = bp_info[0]['controller_ip'] if bp_info else '192.168.1.222'
+            controller_port = bp_info[0].get('controller_port', 80) if bp_info else 80
+        else:
+            controller_ip = '192.168.1.222'  # Default single-backplane IP
+            controller_port = 80
+        
+        with open(deployment_info_file, 'w') as f:
+            json.dump({
+                'topology_file': args.topology,
+                'controller_ip': controller_ip,
+                'controller_port': controller_port,
+                'deployment_plan': {
+                    'total_neurons': deployment_plan.total_neurons,
+                    'total_synapses': deployment_plan.total_synapses,
+                    'backplane_nodes': deployment_plan.backplane_nodes,
+                    'neuron_map': {
+                        str(k): v for k, v in deployment_plan.neuron_map.items()
+                    }
+                },
+                'timestamp': time.time()
+            }, f, indent=2)
+        
+        return 0
+    else:
+        print(f"\n[FAIL] Deployment failed on {total - successful} nodes", file=sys.stderr)
+        return 1
+
+
+def status_snn(args):
+    """Show SNN status."""
+    # Load last deployment info
+    deployment_info_file = os.path.expanduser('~/.neurofab/last_deployment.json')
+    
+    if not os.path.exists(deployment_info_file):
+        print("No SNN deployed")
+        return 0
+    
+    with open(deployment_info_file, 'r') as f:
+        info = json.load(f)
+    
+    deployment_plan = info['deployment_plan']
+    
+    print("SNN Status:")
+    print("=" * 60)
+    print(f"  Topology:       {os.path.basename(info['topology_file'])}")
+    print(f"  Total Neurons:  {deployment_plan['total_neurons']}")
+    print(f"  Total Synapses: {deployment_plan['total_synapses']}")
+    print(f"  Backplanes:     {len(deployment_plan['backplane_nodes'])}")
+    
+    print(f"\nDistribution:")
+    for bp_name, node_list in deployment_plan['backplane_nodes'].items():
+        print(f"  {bp_name}: {len(node_list)} nodes")
+    
+    return 0
+
+
+def start_snn(args):
+    """Start SNN execution."""
+    print("Starting SNN execution...")
+    
+    # Load deployment info
+    deployment_info_file = os.path.expanduser('~/.neurofab/last_deployment.json')
+    if not os.path.exists(deployment_info_file):
+        print("Error: No SNN deployed. Use 'nsnn deploy' first.", file=sys.stderr)
+        return 1
+    
+    with open(deployment_info_file, 'r') as f:
+        info = json.load(f)
+    
+    deployment_plan = info['deployment_plan']
+    
+    # Get cluster configuration
+    config = ClusterConfig(args.config)
+    
+    # Start SNN on each backplane
+    for bp_name in deployment_plan['backplane_nodes'].keys():
+        # Try to get backplane from config
+        bp = config.get_backplane(bp_name)
+        
+        # If not found, use deployment info controller IP (saves during deployment)
+        if not bp:
+            print(f"Warning: Backplane '{bp_name}' not found in configuration", file=sys.stderr)
+            # Use controller IP from deployment info
+            controller_ip = info.get('controller_ip', '192.168.1.222')
+            controller_port = info.get('controller_port', 80)
+            print(f"  Using deployment controller: {controller_ip}:{controller_port}")
+        else:
+            controller_ip = bp.controller_ip
+            controller_port = bp.controller_port
+        
+        try:
+            client = Z1Client(controller_ip=controller_ip, port=controller_port)
+            client.start_snn()
+            print(f"  {bp_name}: Started [OK]")
+        except Exception as e:
+            print(f"  {bp_name}: ERROR - {e}", file=sys.stderr)
+    
+    print("\n[OK] SNN started")
+    return 0
+
+
+def stop_snn(args):
+    """Stop SNN execution."""
+    print("Stopping SNN execution...")
+    
+    # Load deployment info
+    deployment_info_file = os.path.expanduser('~/.neurofab/last_deployment.json')
+    if not os.path.exists(deployment_info_file):
+        print("Warning: No deployment info found")
+        return 0
+    
+    with open(deployment_info_file, 'r') as f:
+        info = json.load(f)
+    
+    deployment_plan = info['deployment_plan']
+    
+    # Get cluster configuration
+    config = ClusterConfig(args.config)
+    
+    # Stop SNN on each backplane
+    for bp_name in deployment_plan['backplane_nodes'].keys():
+        bp = config.get_backplane(bp_name)
+        if not bp:
+            continue
+        
+        try:
+            client = Z1Client(controller_ip=bp.controller_ip, port=bp.controller_port)
+            client.stop_snn()
+            print(f"  {bp_name}: Stopped [OK]")
+        except Exception as e:
+            print(f"  {bp_name}: ERROR - {e}", file=sys.stderr)
+    
+    print("\n[OK] SNN stopped")
+    return 0
+
+
+def monitor_snn(args):
+    """Monitor SNN spike activity."""
+    duration_ms = args.duration
+    
+    print(f"Monitoring spike activity for {duration_ms}ms...")
+    
+    # Load deployment info
+    deployment_info_file = os.path.expanduser('~/.neurofab/last_deployment.json')
+    if not os.path.exists(deployment_info_file):
+        print("Error: No SNN deployed", file=sys.stderr)
+        return 1
+    
+    with open(deployment_info_file, 'r') as f:
+        info = json.load(f)
+    
+    deployment_plan = info['deployment_plan']
+    config = ClusterConfig(args.config)
+    
+    # Collect spikes from all backplanes
+    all_spikes = []
+    
+    for bp_name in deployment_plan['backplane_nodes'].keys():
+        bp = config.get_backplane(bp_name)
+        if not bp:
+            continue
+        
+        try:
+            client = Z1Client(controller_ip=bp.controller_ip, port=bp.controller_port)
+            spikes = client.get_spike_events(duration_ms=duration_ms)
+            
+            # Tag spikes with backplane
+            for spike in spikes:
+                spike.backplane = bp_name
+            
+            all_spikes.extend(spikes)
+            print(f"  {bp_name}: {len(spikes)} spikes")
+        except Exception as e:
+            print(f"  {bp_name}: ERROR - {e}", file=sys.stderr)
+    
+    print(f"\nTotal spikes captured: {len(all_spikes)}")
+    
+    if all_spikes:
+        spike_rate = (len(all_spikes) * 1000.0) / duration_ms
+        print(f"Spike rate: {spike_rate:.2f} Hz")
+    
+    return 0
+
+
+def inject_spikes(args):
+    """Inject input spikes."""
+    print(f"Loading spike pattern: {args.pattern}")
+    
+    with open(args.pattern, 'r') as f:
+        pattern = json.load(f)
+    
+    spikes = pattern.get('spikes', [])
+    
+    print(f"Injecting {len(spikes)} spikes...")
+    
+    # Load deployment info to find which backplane has input neurons
+    deployment_info_file = os.path.expanduser('~/.neurofab/last_deployment.json')
+    if not os.path.exists(deployment_info_file):
+        print("Error: No SNN deployed", file=sys.stderr)
+        return 1
+    
+    with open(deployment_info_file, 'r') as f:
+        info = json.load(f)
+    
+    deployment_plan = info['deployment_plan']
+    neuron_map = {int(k): v for k, v in deployment_plan['neuron_map'].items()}
+    
+    # Group spikes by backplane
+    spikes_by_backplane = {}
+    for spike in spikes:
+        neuron_id = spike['neuron_id']
+        if neuron_id in neuron_map:
+            bp_name, node_id, local_id = neuron_map[neuron_id]
+            if bp_name not in spikes_by_backplane:
+                spikes_by_backplane[bp_name] = []
+            spikes_by_backplane[bp_name].append(spike)
+    
+    # Inject spikes to each backplane
+    config = ClusterConfig(args.config)
+    
+    for bp_name, bp_spikes in spikes_by_backplane.items():
+        bp = config.get_backplane(bp_name)
+        if not bp:
+            print(f"Warning: Backplane '{bp_name}' not found in configuration", file=sys.stderr)
+            # Use controller IP from deployment info or command line
+            if args.controller:
+                controller_ip = args.controller
+                controller_port = 80
+            else:
+                controller_ip = info.get('controller_ip', '192.168.1.222')
+                controller_port = info.get('controller_port', 80)
+            print(f"  Using deployment controller: {controller_ip}:{controller_port}")
+        else:
+            controller_ip = bp.controller_ip
+            controller_port = bp.controller_port
+        
+        try:
+            client = Z1Client(controller_ip=controller_ip, port=controller_port)
+            client.inject_spikes(bp_spikes)
+            print(f"  {bp_name}: {len(bp_spikes)} spikes injected [OK]")
+        except Exception as e:
+            print(f"  {bp_name}: ERROR - {e}", file=sys.stderr)
+    
+    print(f"\n[OK] Spikes injected")
+    return 0
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description='Manage Spiking Neural Networks on Z1 cluster',
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Commands:
+  deploy TOPOLOGY       Deploy SNN from topology JSON file
+  status                Show SNN status and statistics
+  start                 Start SNN execution
+  stop                  Stop SNN execution
+  monitor DURATION      Monitor spike activity (milliseconds)
+  inject PATTERN        Inject input spikes from JSON file
+
+Examples:
+  nsnn deploy network.json                  # Deploy to default backplane
+  nsnn deploy network.json --all            # Deploy across all backplanes
+  nsnn status                               # Show deployment status
+  nsnn start                                # Start execution
+  nsnn monitor 5000                         # Monitor for 5 seconds
+  nsnn inject input.json                    # Inject input pattern
+  nsnn stop                                 # Stop execution
+        """
+    )
+    
+    parser.add_argument('command', 
+                       choices=['deploy', 'status', 'start', 'stop', 'monitor', 'inject'],
+                       help='Command to execute')
+    parser.add_argument('argument', nargs='?',
+                       help='Command argument (topology file, duration, pattern file)')
+    parser.add_argument('-c', '--controller',
+                       default=None,
+                       help='Controller IP address (overrides environment/config)')
+    parser.add_argument('--config',
+                       help='Cluster configuration file')
+    parser.add_argument('--all',
+                       action='store_true',
+                       help='Use all configured backplanes')
+    
+    args = parser.parse_args()
+    
+    try:
+        if args.command == 'deploy':
+            if not args.argument:
+                print("Error: topology file required", file=sys.stderr)
+                return 1
+            args.topology = args.argument
+            return deploy_snn(args)
+        
+        elif args.command == 'status':
+            return status_snn(args)
+        
+        elif args.command == 'start':
+            return start_snn(args)
+        
+        elif args.command == 'stop':
+            return stop_snn(args)
+        
+        elif args.command == 'monitor':
+            if not args.argument:
+                print("Error: duration required", file=sys.stderr)
+                return 1
+            args.duration = int(args.argument)
+            return monitor_snn(args)
+        
+        elif args.command == 'inject':
+            if not args.argument:
+                print("Error: pattern file required", file=sys.stderr)
+                return 1
+            args.pattern = args.argument
+            return inject_spikes(args)
+    
+    except Z1ClusterError as e:
+        print(f"Error: {e}", file=sys.stderr)
+        return 1
+    except KeyboardInterrupt:
+        print("\nInterrupted", file=sys.stderr)
+        return 130
+    except Exception as e:
+        print(f"Error: {e}", file=sys.stderr)
+        import traceback
+        traceback.print_exc()
+        return 1
+
+
+if __name__ == '__main__':
+    sys.exit(main())

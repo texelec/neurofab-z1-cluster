@@ -1,0 +1,120 @@
+#!/usr/bin/env python3
+"""
+nstat - Show Z1 cluster status
+
+Unix-style utility to display cluster status and statistics.
+"""
+
+import sys
+import os
+import argparse
+import time
+from datetime import datetime
+
+# Add lib directory to path
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'lib'))
+
+from z1_client import Z1Client, Z1ClusterError, format_memory_size, format_uptime
+
+
+def print_cluster_status(client: Z1Client, show_snn: bool = False):
+    """Print cluster status."""
+    # Get node list
+    nodes = client.list_nodes()
+    active_nodes = [n for n in nodes if n.status == 'active']
+    
+    # Calculate statistics
+    total_memory = sum(n.memory_free for n in active_nodes)
+    
+    # Print header
+    print(f"Z1 Cluster Status - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    print("=" * 80)
+    
+    # Cluster overview
+    print(f"\nCluster Overview:")
+    print(f"  Total Nodes:     {len(nodes)}")
+    print(f"  Active Nodes:    {len(active_nodes)}")
+    print(f"  Inactive Nodes:  {len(nodes) - len(active_nodes)}")
+    print(f"  Total Memory:    {format_memory_size(total_memory)}")
+    
+    # Node details
+    print(f"\nNode Status:")
+    print(f"  NODE  STATUS    MEMORY      UPTIME      LED (R/G/B)")
+    print(f"  {'-' * 70}")
+    
+    for node in sorted(nodes, key=lambda n: n.node_id):
+        led_str = f"{node.led_state['r']:3d}/{node.led_state['g']:3d}/{node.led_state['b']:3d}"
+        print(f"  {node.node_id:4d}  {node.status:8s}  "
+              f"{format_memory_size(node.memory_free):10s}  "
+              f"{format_uptime(node.uptime_ms):>10s}  "
+              f"{led_str}")
+    
+    # SNN status if requested
+    if show_snn:
+        try:
+            snn_status = client.get_snn_status()
+            print(f"\nSNN Status:")
+            print(f"  State:           {snn_status.get('state', 'unknown')}")
+            print(f"  Neurons:         {snn_status.get('neuron_count', 0)}")
+            print(f"  Active Neurons:  {snn_status.get('active_neurons', 0)}")
+            print(f"  Total Spikes:    {snn_status.get('total_spikes', 0)}")
+            print(f"  Spike Rate:      {snn_status.get('spike_rate_hz', 0):.2f} Hz")
+        except Z1ClusterError:
+            print(f"\nSNN Status: Not available")
+    
+    print()
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description='Show Z1 cluster status and statistics',
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  nstat                  Show cluster status once
+  nstat -w 1             Live monitoring (refresh every 1 second)
+  nstat -s               Show SNN activity statistics
+  nstat -w 2 -s          Live monitoring with SNN stats
+        """
+    )
+    
+    parser.add_argument('-c', '--controller',
+                       default=None,
+                       help='Controller IP address (overrides environment/config)')
+    parser.add_argument('-w', '--watch',
+                       type=int,
+                       metavar='SECONDS',
+                       help='Refresh every N seconds')
+    parser.add_argument('-s', '--snn',
+                       action='store_true',
+                       help='Show SNN activity statistics')
+    
+    args = parser.parse_args()
+    
+    try:
+        client = Z1Client(controller_ip=args.controller)
+        
+        if args.watch:
+            # Live monitoring mode
+            try:
+                while True:
+                    # Clear screen (ANSI escape code)
+                    print('\033[2J\033[H', end='')
+                    print_cluster_status(client, show_snn=args.snn)
+                    time.sleep(args.watch)
+            except KeyboardInterrupt:
+                print("\nMonitoring stopped", file=sys.stderr)
+                return 0
+        else:
+            # One-time status
+            print_cluster_status(client, show_snn=args.snn)
+        
+        return 0
+        
+    except Z1ClusterError as e:
+        print(f"Error: {e}", file=sys.stderr)
+        return 1
+
+
+if __name__ == '__main__':
+    sys.exit(main())

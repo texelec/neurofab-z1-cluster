@@ -1,0 +1,67 @@
+; Z1 Onyx Bus - TX State Machine (Phase 1)
+; Transmits frames with source-synchronous clock and inline control flags
+; 
+; Pin mapping:
+;   OUT pins: BUS_DATA[15:0] (GPIO 12-27, 16 pins)
+;   SET pins: BUS_CLK (GPIO 6, 1 pin)
+;   Side-set: BUS_SELECT0 (GPIO 7, 1 pin) - SOP flag
+;
+; Frame format from FIFO (per protocol spec):
+;   Beat 0 (SOP=1): Type[15:12], Dest[11:8], StreamID[7:0]
+;   Beat 1: Length in bytes
+;   Beat 2: Payload beat count (for PIO loop control)
+;   Beat 3..N: Payload data
+;   Future: CRC16 trailer, EOP flag on SELECT1
+;
+; Clock timing: Data valid on rising edge, changes on falling edge
+; SELECT flags change simultaneously with data
+
+.program z1_bus_tx
+.side_set 1 opt    ; BUSCLK control via side-set (like working code)
+
+; Timing: Data stable before CLK rises, receiver samples on rising edge
+.wrap_target
+    out pins, 16        side 0  ; Output beat to DATA pins, CLK low (autopull if OSR empty)
+    nop                 side 0  ; Data setup time, CLK stays low
+    nop                 side 1  ; CLK high - receiver samples here
+    nop                 side 0  ; CLK low - back to idle, ready for next beat
+.wrap
+
+% c-sdk {
+static inline void z1_bus_tx_program_init(PIO pio, uint sm, uint offset,
+                                           uint clk_pin, uint data_base_pin) {
+    // Configure GPIO for PIO control and set as outputs BEFORE creating config
+    pio_gpio_init(pio, clk_pin);
+    pio_sm_set_consecutive_pindirs(pio, sm, clk_pin, 1, true);
+    
+    for (int i = 0; i < 16; i++) {
+        pio_gpio_init(pio, data_base_pin + i);
+    }
+    pio_sm_set_consecutive_pindirs(pio, sm, data_base_pin, 16, true);
+    
+    // Create state machine config
+    pio_sm_config c = z1_bus_tx_program_get_default_config(offset);
+    
+    // OUT pins: DATA[15:0] (16 pins)
+    sm_config_set_out_pins(&c, data_base_pin, 16);
+    
+    // Side-set pin: CLK (controlled via side-set on every instruction)
+    sm_config_set_sideset_pins(&c, clk_pin);
+    
+    // Autopull enabled with 16-bit threshold
+    sm_config_set_out_shift(&c, false, true, 16);  // shift_right, autopull=TRUE, threshold=16
+    
+    // Clock divider for beat rate
+    // beat_rate = sysclk / (div * instructions_per_beat)
+    // For 5 MHz beat rate: div = 266MHz / (5MHz * 4) = 13.3
+    // RC settling: 50kΩ × 100pF = 5μs time constant, 15μs for 95% settled
+    sm_config_set_clkdiv(&c, 13.3f);
+    
+    // Initialize state machine with config
+    pio_sm_init(pio, sm, offset, &c);
+    
+    // DO NOT enable TX at init - will be enabled per transmission (working code pattern)
+    // pio_sm_set_enabled(pio, sm, true);  // REMOVED - breaks working pattern
+}
+%}
+
