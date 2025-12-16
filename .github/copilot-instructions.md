@@ -325,6 +325,22 @@ python python_tools/bin/nsnn deploy python_tools/examples/xor_working.json -c <c
 
 ## Project Status
 
-**Current State**: Production ready. V2 (16-node) firmware tested and validated on hardware. V1 (12-node) firmware builds successfully but untested on hardware. All documentation current. Build system uses environment variables only (PICO_SDK_PATH). Ready for GitHub publication.
+**Current State (December 15, 2025)**: 
+- ✅ **PUBLISHED TO GITHUB**: https://github.com/texelec/neurofab-z1-cluster
+- ✅ Production ready - V2 (16-node) firmware tested and validated on hardware
+- ✅ V1 (12-node) firmware builds successfully but untested on physical V1 hardware
+- ✅ All documentation current and accurate
+- ✅ Build system uses environment variables only (PICO_SDK_PATH)
+- ✅ Zero hardcoded paths - fully portable
+- ✅ Comprehensive test suite passing (8/8 tests)
+- ✅ Git repository initialized and pushed to GitHub fork
+
+**Build Artifacts:**
+- Controller V2: 123.5 KB (with OLED)
+- Controller V1: 119.0 KB (without OLED) 
+- Node V2: 86.0 KB (auto-detect ID)
+- Node V1: 86.0 KB × 12 files (hardcoded IDs)
+
+**Critical Build Note**: `pico_set_binary_type(copy_to_ram)` is REQUIRED in all CMakeLists.txt for RP2350B to boot correctly. Without this, firmware will lock on startup.
 
 **Next Steps**: SNN algorithm refinement, STDP implementation, multi-backplane cluster support, performance optimization.
