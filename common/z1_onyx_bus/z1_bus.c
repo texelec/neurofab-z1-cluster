@@ -1,5 +1,6 @@
 /**
  * Z1 Onyx Bus - Core Management Layer
+ * Code by NeuroFab Corp: 2025-2026
  * 
  * Source-synchronous multi-master bus implementation
  * Phase 1: Basic TX/RX without arbitration
@@ -138,9 +139,28 @@ static volatile uint8_t sender_node_id = 0xFF;  // Invalid until set
 
 // Buffers (sized for efficient DMA)
 #define RX_BUFFER_SIZE 8192  // 8192 words = 16KB, power of 2 for ring buffer
-static uint16_t rx_buffer[RX_BUFFER_SIZE] __attribute__((aligned(4)));
+static uint16_t rx_buffer[RX_BUFFER_SIZE] __attribute__((aligned(16384)));  // 16KB aligned for DMA ring wrap
 static volatile uint32_t rx_write_index = 0;  // DMA writes here
 static volatile uint32_t rx_read_index = 0;   // Application reads here
+
+// RX Frame State Machine (moved here for visibility in init function)
+typedef enum {
+    RX_STATE_WAIT_HEADER,
+    RX_STATE_WAIT_LENGTH,
+    RX_STATE_WAIT_PAYLOAD,
+    RX_STATE_WAIT_CRC,
+    RX_STATE_DISCARD_WAIT_LENGTH,  // Frame rejected, need to read length to know how much to skip
+    RX_STATE_DISCARD_SKIP           // Skipping payload+CRC of rejected frame
+} rx_frame_state_t;
+
+static rx_frame_state_t rx_state = RX_STATE_WAIT_HEADER;
+static uint16_t rx_header = 0;
+static uint16_t rx_length = 0;
+static uint16_t rx_payload[600];
+static uint16_t rx_payload_idx = 0;
+static uint16_t rx_payload_words = 0;
+static uint16_t rx_discard_remaining = 0;  // Beats remaining to skip for rejected frames
+static absolute_time_t rx_frame_start = {0};  // Track RX frame timing
 
 // Forward declarations
 uint32_t z1_bus_rx_depth(void);
@@ -227,6 +247,18 @@ void z1_bus_init_controller(void) {
  * Bidirectional: TX + RX for multi-master support
  */
 void z1_bus_init_node(void) {
+    // CRITICAL: Reset RX state machine variables (important for APP_PARTITION_MODE)
+    // Bootloader may have left these in mid-frame state
+    rx_state = RX_STATE_WAIT_HEADER;
+    rx_header = 0;
+    rx_length = 0;
+    rx_payload_idx = 0;
+    rx_payload_words = 0;
+    rx_discard_remaining = 0;
+    rx_read_index = 0;
+    rx_write_index = 0;
+    memset(rx_payload, 0, sizeof(rx_payload));
+    
     // SELECT0 used for carrier sense (bus busy/idle indicator)
     // Nodes monitor SELECT0, drive HIGH when transmitting
     gpio_init(BUS_SELECT0_PIN);
@@ -379,7 +411,12 @@ bool z1_bus_send_frame(uint8_t frame_type, uint8_t dest_id, uint8_t stream_id, c
     // Apply RP2350-E5 DMA errata workaround
     hw_clear_bits(&dma_hw->ch[tx_dma_chan].ctrl_trig, DMA_CH0_CTRL_TRIG_EN_BITS);
     dma_channel_abort(tx_dma_chan);
+    uint32_t pre_abort_timeout = 0;
     while (dma_channel_is_busy(tx_dma_chan)) {
+        if (++pre_abort_timeout > 10000) {
+            printf("[BUS] PRE-TX DMA abort timeout - DMA hardware stuck!\n");
+            return false;  // Cannot transmit - DMA is stuck
+        }
         tight_loop_contents();
     }
     
@@ -407,16 +444,29 @@ bool z1_bus_send_frame(uint8_t frame_type, uint8_t dest_id, uint8_t stream_id, c
         true
     );
     
-    // Wait for FIFO to have data, then enable PIO
+    // Wait for FIFO to have data, then enable PIO (WITH TIMEOUT)
+    uint32_t fifo_wait = 0;
     while (pio_sm_get_tx_fifo_level(bus_pio, tx_sm) == 0) {
+        if (++fifo_wait > 10000) {
+            printf("[BUS] FIFO fill timeout - aborting TX\n");
+            goto cleanup_and_return;
+        }
         tight_loop_contents();
     }
     
     pio_sm_set_enabled(bus_pio, tx_sm, true);
     
-    // Wait for completion
-    dma_channel_wait_for_finish_blocking(tx_dma_chan);
+    // Wait for completion (WITH TIMEOUT - SDK call blocks forever if DMA hangs)
+    uint32_t dma_wait = 0;
+    while (dma_channel_is_busy(tx_dma_chan)) {
+        if (++dma_wait > 100000) {
+            printf("[BUS] DMA completion timeout - forcing abort\n");
+            break;
+        }
+        tight_loop_contents();
+    }
     
+cleanup_and_return:
     // Clean up DMA channel state
     hw_clear_bits(&dma_hw->ch[tx_dma_chan].ctrl_trig, DMA_CH0_CTRL_TRIG_EN_BITS);
     dma_channel_abort(tx_dma_chan);
@@ -503,7 +553,23 @@ bool z1_bus_rx_read(uint16_t *data) {
     // Prevents infinite loop if DMA pointer becomes invalid after continuous operation
     uintptr_t buffer_end = buffer_start + (RX_BUFFER_SIZE * sizeof(uint16_t));
     if (write_addr < buffer_start || write_addr >= buffer_end) {
-        // DMA write pointer out of range - return false to prevent infinite loop
+        // DMA write pointer out of range - HARDWARE FAILURE DETECTED
+        // This happens after heavy bus traffic corrupts the DMA channel state
+        static uint32_t last_recovery_time = 0;
+        uint32_t now = time_us_32();
+        
+        // Rate-limit recovery attempts to once per 100ms (10 Hz max recovery rate)
+        if (now - last_recovery_time > 100000) {
+            printf("[BUS-RX CRITICAL] DMA corruption detected! addr=0x%08X (valid: 0x%08X-0x%08X)\n",
+                   write_addr, buffer_start, buffer_end);
+            printf("[BUS-RX RECOVERY] Resetting RX DMA and state machine...\n");
+            
+            // Perform full hardware reset
+            z1_bus_rx_flush();
+            
+            printf("[BUS-RX RECOVERY] Reset complete - RX operational\n");
+            last_recovery_time = now;
+        }
         return false;
     }
     
@@ -588,6 +654,13 @@ void z1_bus_rx_flush(void) {
     rx_read_index = 0;
     rx_write_index = 0;
     
+    // STEP 5.5: CRITICAL - Reset RX state machine to WAIT_HEADER
+    // Without this, state machine stays in mid-frame state with no data!
+    rx_state = RX_STATE_WAIT_HEADER;
+    rx_payload_idx = 0;
+    rx_payload_words = 0;
+    rx_discard_remaining = 0;
+    
     // STEP 6: Re-enable RX state machine (atomic flush complete)
     pio_sm_set_enabled(bus_pio, rx_sm, true);
     
@@ -617,28 +690,6 @@ uint8_t z1_bus_get_node_id(void) {
 bool z1_bus_carrier_sense(void) {
     return gpio_get(BUS_SELECT0_PIN);
 }
-
-/**
- * RX Frame State Machine (internal to library)
- */
-typedef enum {
-    RX_STATE_WAIT_HEADER,
-    RX_STATE_WAIT_LENGTH,
-    RX_STATE_WAIT_PAYLOAD,
-    RX_STATE_WAIT_CRC,
-    RX_STATE_DISCARD_WAIT_LENGTH,  // Frame rejected, need to read length to know how much to skip
-    RX_STATE_DISCARD_SKIP           // Skipping payload+CRC of rejected frame
-} rx_frame_state_t;
-
-static rx_frame_state_t rx_state = RX_STATE_WAIT_HEADER;
-static uint16_t rx_header = 0;
-static uint16_t rx_length = 0;
-// CRITICAL BUFFER: Must match Z1_BROKER_MAX_PAYLOAD_WORDS (600 words = 1200 bytes)
-static uint16_t rx_payload[600];
-static uint16_t rx_payload_idx = 0;
-static uint16_t rx_payload_words = 0;
-static uint16_t rx_discard_remaining = 0;  // Beats remaining to skip for rejected frames
-static absolute_time_t rx_frame_start = {0};  // Track RX frame timing
 
 // Phase 3a: ACK/NAK tracking
 static volatile bool last_ack_received = false;
@@ -686,8 +737,20 @@ bool z1_bus_try_receive_frame(z1_frame_t *frame) {
                 bool no_ack = (rx_header & 0x08) != 0;
                 uint8_t stream = rx_header & 0x07;
                 
-                // Filter: accept frames addressed to us or broadcast (31), BUT NOT from ourselves (loopback)
-                if ((dest == sender_node_id || dest == 31) && src != sender_node_id) {
+                // Filter: accept frames addressed to us or broadcast (31)
+                // For broadcasts, MUST accept from ourselves (intra-node synapses!)
+                // For unicast, reject loopback to avoid confusion
+                bool is_broadcast = (dest == 31);
+                bool addressed_to_me = (dest == sender_node_id || is_broadcast);
+                bool not_loopback = (src != sender_node_id);
+                
+                // DEBUG: Log ALL CTRL frames on streams 1/2/3 (not just stream 3)
+                if (type == 3 && stream >= 1 && stream <= 3) {
+                    printf("[BUS-RX] CTRL stream %d: header=0x%04X src=%d dest=%d me=%d myself=%d\n", 
+                           stream, rx_header, src, dest, addressed_to_me, sender_node_id);
+                }
+                
+                if (addressed_to_me && (is_broadcast || not_loopback)) {
                     // Store parsed header fields
                     frame->type = type;
                     frame->src = src;

@@ -17,19 +17,20 @@ This is the **NeuroFab Z1 Onyx** - a distributed spiking neural network (SNN) ha
 The project supports **TWO** hardware versions with a single codebase:
 
 ### V2 Hardware (16-node, Current/Default)
-- 16 compute nodes with auto-detection via IO pins
-- OLED display (I2C0, SDA=GPIO28, SCL=GPIO29)
-- Global node reset capability (GPIO 33)
+- 16 compute nodes with auto-detection via GPIO pins (runtime)
+- OLED display on controller only (I2C0, SDA=GPIO28, SCL=GPIO29)
+- NO OLED on nodes
+- Global node reset capability (GPIO 33, software reset used in practice)
 - W5500 Ethernet: RST=GPIO34, INT=GPIO35
-- Single node firmware binary (`node_16.uf2`)
+- Single node firmware binary (`node_dual_16.uf2` - dual-partition with bootloader)
 - **Build**: `python build.py` or `python build.py --hw-v2`
 
 ### V1 Hardware (12-node, Legacy)
-- 12 compute nodes with hardcoded node IDs (0-11)
-- NO OLED display
+- 12 compute nodes with hardcoded node IDs (0-11, compile-time constant)
+- NO OLED display (neither controller nor nodes)
 - NO global reset capability
 - W5500 Ethernet: RST=GPIO35, INT=GPIO34 (**SWAPPED from V2**)
-- Individual node firmware per ID (`node_12_0.uf2` through `node_12_11.uf2`)
+- Individual node firmware per ID (`node_dual_12_0.uf2` through `node_dual_12_11.uf2`)
 - **Build**: `python build.py --hw-v1`
 - **NOTE**: V1 firmware builds successfully but has NOT been tested on physical V1 hardware
 
@@ -46,12 +47,20 @@ The project supports **TWO** hardware versions with a single codebase:
 ### Build Targets
 
 **V2 (16-node):**
-- `controller_16` - Controller firmware
-- `node_16` - Single node firmware (auto-detects node ID)
+- `controller_16` - Controller firmware (monolithic)
+- `bootloader_16` - Bootloader only (OTA update engine)
+- `node_app_16` - Application partition (OTA-capable SNN firmware)
+- `node_dual_16.uf2` - Combined bootloader + app (created by build scripts)
 
 **V1 (12-node):**
-- `controller_12` - Controller firmware
-- `node_12_0` through `node_12_11` - Individual node firmwares (one per node)
+- `controller_12` - Controller firmware (monolithic)
+- `bootloader_12` - Bootloader only (OTA update engine)
+- `node_app_12_0` through `node_app_12_11` - Application partitions (one per node)
+- `node_dual_12_N.uf2` - Combined bootloader + app for each node (N=0-11)
+
+**Deprecated** (removed January 18, 2026):
+- `node_16` - Monolithic V2 node (replaced by dual-partition)
+- `node_12_N` - Monolithic V1 nodes (replaced by dual-partition)
 
 ### Build Commands
 
@@ -73,15 +82,28 @@ ninja controller_16 node_16
 ```
 build/                          # All ELF, hex, bin files stay here
 FirmwareReleases/
-  ├── 16node/                   # V2 UF2 files only
-  │   ├── controller_16.uf2
-  │   └── node_16.uf2
-  └── 12node/                   # V1 UF2 files only
-      ├── controller_12.uf2
-      ├── node_12_0.uf2
-      ├── node_12_1.uf2
-      └── ... (12 node files + 1 controller)
-```
+  ├── 16node/                   # V2 firmware
+  │   ├── controller_16.uf2     # Controller (root - commonly used)
+  │   ├── node_dual_16.uf2      # Node firmware (root - commonly used, OTA-capable)
+  │   └── apponly/              # Advanced/recovery files
+  │       ├── bootloader_16.uf2 # Bootloader only
+  │       └── node_app_16.uf2   # Application only
+  └── 12node/                   # V1 firmware
+      ├── controller_12.uf2     # Controller (root - commonly used)
+      ├── node_dual_12_0.uf2    # Node 0 (root - commonly used, OTA-capable)
+      ├── node_dual_12_1.uf2    # Node 1
+      ├── ... (12 total)
+      └── apponly/              # Advanced/recovery files
+          ├── bootloader_12.uf2 # Bootloader only
+          ├── node_app_12_0.uf2 # App partition for node 0
+          └── ... (12 total)
+
+packages/
+  ├── node_app_16.bin        01 (changed from 192.168.1.222)
+- **Single point of change**: Edit IP_ADDRESS array in `controller/w5500_eth.c` (line ~25)
+- **Runtime config**: Use `python python_tools/bin/zconfig write --ip <new_ip>` (no rebuild!)
+- **Automatic propagation**: OLED display and HTTP responses use `w5500_get_ip_string()` helper
+- **Python tools**: Default to 192.168.1.201
 
 ### UF2 Conversion
 - **Tool**: `build_tools/elf2uf2.py` (custom Python converter)
@@ -324,23 +346,34 @@ python python_tools/bin/nsnn deploy python_tools/examples/xor_working.json -c <c
 ---
 
 ## Project Status
+## Project Status
 
-**Current State (December 15, 2025)**: 
-- ✅ **PUBLISHED TO GITHUB**: https://github.com/texelec/neurofab-z1-cluster
-- ✅ Production ready - V2 (16-node) firmware tested and validated on hardware
+**Current State (January 18, 2026)**: 
+- ✅ **PRODUCTION READY**: https://github.com/texelec/neurofab-z1-cluster
+- ✅ V2 (16-node) firmware tested and validated on hardware
 - ✅ V1 (12-node) firmware builds successfully but untested on physical V1 hardware
 - ✅ All documentation current and accurate
 - ✅ Build system uses environment variables only (PICO_SDK_PATH)
 - ✅ Zero hardcoded paths - fully portable
-- ✅ Comprehensive test suite passing (8/8 tests)
-- ✅ Git repository initialized and pushed to GitHub fork
+- ✅ Comprehensive test suite passing (9/9 tests)
+- ✅ **OTA firmware updates** operational (`nflash` tool)
+- ✅ **Dual-partition bootloader** (512KB + 7.5MB app)
+- ✅ **Streaming file system** (1MB+ topology upload/download via `zengine`)
+- ✅ **Async spike injection** (background job queue, non-blocking)
+- ✅ **Runtime network config** (`zconfig` - no rebuild for IP/MAC changes)
+- ✅ **USB flash utilities** (`flash_node.py`, `flash_controller.py` in root)
+- ✅ **Monolithic node firmware deprecated** (removed, OTA dual-partition only)
+- ✅ **app_main.c deprecated** (replaced with node_main.c for V1 consistency)
 
 **Build Artifacts:**
-- Controller V2: 123.5 KB (with OLED)
-- Controller V1: 119.0 KB (without OLED) 
-- Node V2: 86.0 KB (auto-detect ID)
-- Node V1: 86.0 KB × 12 files (hardcoded IDs)
+- Controller V2: 343.0 KB (with OLED)
+- Controller V1: 337.5 KB (without OLED) 
+- Node V2 app: 44.3 KB (auto-detect ID, OTA-ready)
+- Node V1 app: 44.3 KB × 12 files (hardcoded IDs, OTA-ready)
+- Dual-partition V2: 178.5 KB (bootloader + app)
+- Dual-partition V1: 180.0 KB × 12 files (bootloader + app per node)
 
+**Critical Build Note**: `pico_set_binary_type(copy_to_ram)` is REQUIRED in controller CMakeLists.txt for RP2350B to boot correctly. Without this, firmware will lock on startup. NOTE: This is NOT used in node app partitions (they run from flash with bootloader).
 **Critical Build Note**: `pico_set_binary_type(copy_to_ram)` is REQUIRED in all CMakeLists.txt for RP2350B to boot correctly. Without this, firmware will lock on startup.
 
 **Next Steps**: SNN algorithm refinement, STDP implementation, multi-backplane cluster support, performance optimization.

@@ -1,5 +1,6 @@
 /**
  * Z1 Onyx Bus - Broker Layer
+ * Code by NeuroFab Corp: 2025-2026
  * 
  * Provides collision-aware multi-master arbitration for distributed SNN.
  * Implements priority CSMA with carrier sense and adaptive retry.
@@ -62,19 +63,26 @@
 // Configuration Constants
 // ============================================================================
 
-// Dual-queue architecture for spike/command separation
-#define Z1_BROKER_SPIKE_QUEUE_DEPTH 128     // Spike queue (128 × 40 bytes = 5120 bytes)
-#define Z1_BROKER_CMD_QUEUE_DEPTH   16      // Command queue (16 × 40 bytes = 640 bytes)
+// BOOTLOADER MODE: Minimal queues (OTA only, no SNN)
+#ifdef BOOTLOADER_BUILD
+    #define Z1_BROKER_SPIKE_QUEUE_DEPTH 0       // No spike traffic in bootloader
+    #define Z1_BROKER_CMD_QUEUE_DEPTH   8       // Small command queue for OTA chunks (8 × 1216 = 9,728 bytes)
+    #define Z1_BROKER_MAX_PAYLOAD_WORDS 256     // OTA chunks are 512 bytes max
+// APPLICATION MODE: Full-size queues for SNN operation
+#else
+    #define Z1_BROKER_SPIKE_QUEUE_DEPTH 64      // Spike queue (64 × 1216 bytes = 77,824 bytes)
+    #define Z1_BROKER_CMD_QUEUE_DEPTH   16      // Command queue (16 × 1216 bytes = 19,456 bytes)
+    #define Z1_BROKER_MAX_PAYLOAD_WORDS 600     // Max 1200 bytes per command (memory vs latency tradeoff)
+#endif
+
 // CRITICAL LIMIT: Max single-frame payload size
-// Current: 600 words (1200 bytes) for large neuron deployments
 // NOTE: Spikes are small (<16 words), this limit is for CTRL frame commands only
 // WARNING: Python tools MUST fragment payloads >1KB with delays for broker processing
-#define Z1_BROKER_MAX_PAYLOAD_WORDS 600     // Max 1200 bytes per command (memory vs latency tradeoff)
 
 // Legacy compatibility
 #define Z1_BROKER_QUEUE_DEPTH       Z1_BROKER_SPIKE_QUEUE_DEPTH
 #define Z1_BROKER_MAX_RETRIES       3       // Retry attempts before drop
-#define Z1_BROKER_STALE_TIMEOUT_US  50000   // 50ms max age (1ms SNN processing + margin)
+#define Z1_BROKER_STALE_TIMEOUT_US  5000000   // 5 second max age (bulk spike injection tolerance)
 
 // Backoff algorithm tuning (calculated for 17-node @ 5MHz bus)
 // Frame time: 7 beats × 200ns = 1.4μs (actual spike size, not 259 max)
@@ -124,14 +132,17 @@ typedef struct {
 /**
  * Broker queue structure
  * Dual queues: spike queue (high priority) + command queue (low priority)
+ * NOTE: Bootloader mode has no spike queue (SPIKE_QUEUE_DEPTH=0)
  */
 typedef struct {
-    // Spike queue (Type 0, NOACK, high volume)
+#if Z1_BROKER_SPIKE_QUEUE_DEPTH > 0
+    // Spike queue (Type 0, NOACK, high volume) - only in application mode
     z1_broker_request_t spike_queue[Z1_BROKER_SPIKE_QUEUE_DEPTH];
     uint8_t spike_head;
     uint8_t spike_tail;
     uint8_t spike_count;
     uint8_t spike_peak;
+#endif
     
     // Command queue (Type 1, ACK, low volume)
     z1_broker_request_t cmd_queue[Z1_BROKER_CMD_QUEUE_DEPTH];
@@ -270,6 +281,12 @@ uint32_t z1_broker_get_spike_queue_depth(void);
  * @return Number of pending commands in low-priority queue
  */
 uint32_t z1_broker_get_cmd_queue_depth(void);
+
+/**
+ * Flush spike queue (drop all pending spikes)
+ * Use when stopping SNN to prevent stale spikes from blocking commands
+ */
+void z1_broker_flush_spike_queue(void);
 
 /**
  * Request statistics from a remote node (sends query frame)

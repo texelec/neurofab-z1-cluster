@@ -1,5 +1,6 @@
 /**
  * Z1 Onyx Node - Hardware Pin Definitions
+ * Code by NeuroFab Corp: 2025-2026
  * 
  * Node-specific peripherals (minimal - most resources on controller)
  * NOTE: Nodes have SAME LED pins as controller (GPIO 44/45/46)

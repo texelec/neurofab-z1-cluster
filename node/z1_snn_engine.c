@@ -1,5 +1,6 @@
 /**
  * Z1 Neuromorphic Compute Node - SNN Execution Engine
+ * Code by NeuroFab Corp: 2025-2026
  * 
  * Implements Leaky Integrate-and-Fire (LIF) neuron model with spike processing
  * for distributed spiking neural network execution on RP2350B nodes.
@@ -24,7 +25,7 @@
 #define DEBUG_SPIKE_QUEUE 0      // Log every spike queued
 #define DEBUG_SPIKE_PROCESS 0    // Log spike processing details
 #define DEBUG_STEP_COUNT 0       // Log processed spike count per step
-#define DEBUG_NEURON_FIRE 1      // Log neuron firing (KEEP ON)
+#define DEBUG_NEURON_FIRE 0      // Log neuron firing
 
 // ============================================================================
 // Global State
@@ -164,19 +165,20 @@ static bool spike_queue_pop(z1_spike_t* spike) {
 // Spike Processing
 // ============================================================================
 
+// Forward declaration
+static void fire_neuron(z1_neuron_t* neuron);
+
 /**
  * Process single incoming spike
  * 
  * Handles two cases:
- * 1. Input neuron stimulation: Spike targets a local input neuron (external input)
- * 2. Synaptic integration: Spike from remote neuron propagates through synapses
+ * 1. Direct stimulation: If spike targets a local neuron, directly stimulate it
+ *    (This handles external input injection from controller)
+ * 2. Synaptic propagation: Apply spike to all neurons with synapses from this source
+ *    (This handles spike propagation between neurons)
  * 
- * Algorithm:
- * - Input neurons (leak_rate=0.0): Directly stimulate with spike value
- * - Hidden/output neurons: Find synapses from source, apply weighted integration
- * - Threshold checking happens during leak step (not here)
- * 
- * Note: Input neurons can have both external stimulation AND synaptic connections
+ * Note: Both cases can apply simultaneously - input neurons can receive direct
+ *       stimulation AND serve as synaptic sources to other neurons.
  */
 static void process_spike(const z1_spike_t* spike) {
     uint32_t source_id = spike->neuron_id;
@@ -186,22 +188,60 @@ static void process_spike(const z1_spike_t* spike) {
     uint16_t source_local;
     decode_global_neuron_id(source_id, &source_node, &source_local);
     
-    // SPECIAL CASE: Input neuron stimulation (external spike to local input neuron)
-    // If this is a spike TO a local neuron (not FROM), directly stimulate it
-    // Input neurons are identified by leak_rate=0.0
+    // SPECIAL CASE: Input neuron direct stimulation
+    // If spike targets a LOCAL neuron (from controller injection), check if it's an input neuron
+    // Input neurons have NO incoming synapses (synapse_count == 0 for that neuron in the topology)
+    // However, synapses are stored on TARGET neurons, not source neurons.
+    // So we check: does ANY neuron have a synapse FROM this neuron? If not, it's an input.
     if (source_node == g_engine.node_id && source_local < g_engine.neuron_count) {
         z1_neuron_t* target = &g_engine.neurons[source_local];
         
-        // Stimulate input neurons (leak_rate=0.0 means no decay, i.e., external input)
-        if (target->leak_rate == 0.0f) {
+        // Input neurons have synapse_count == 0 (no incoming connections in topology)
+        // Directly stimulate them like external current injection
+        if (target->synapse_count == 0) {
             target->membrane_potential += spike->value;
             g_engine.stats.spikes_processed++;
             g_engine.stats.membrane_updates++;
-            // Don't return - input neurons can also propagate through synapses
+            
+#if DEBUG_SPIKE_PROCESS
+            printf("[SNN-%u] Input injection: Neuron %u, V_mem += %.3f (now %.3f, threshold %.3f)\n",
+                   g_engine.node_id, source_local, spike->value,
+                   target->membrane_potential, target->threshold);
+#endif
+            
+            // Check threshold IMMEDIATELY (input neurons should fire right away)
+            if (target->membrane_potential >= target->threshold) {
+                if (g_engine.current_time_us >= target->refractory_until_us) {
+                    fire_neuron(target);
+                }
+            }
+            // Don't return - continue to synaptic processing
         }
     }
     
-    // NORMAL CASE: Apply spike to all neurons that have synapses from this source
+    // Process spike to ALL neurons that have synapses from this source
+    // This handles BOTH local and remote spikes:
+    // - Remote spikes: Normal inter-node communication
+    // - Local spikes: Intra-node communication (e.g., Neuron 0 -> Neuron 2 on same node)
+    //
+    // IMPORTANT: We process local spikes because when a neuron fires:
+    // 1. Spike is broadcast over Matrix bus
+    // 2. ALL nodes receive it (including origin node)
+    // 3. Each node applies it to neurons with synapses from that source
+    // 4. Refractory period prevents source neuron from re-firing immediately
+    //
+    // Example: XOR network with Neuron 0 and Neuron 2 both on Node 0
+    // - Neuron 0 fires -> broadcast spike (node=0, local=0)
+    // - Node 0 receives its own broadcast
+    // - Neuron 2 has synapse from Neuron 0 -> applies weight
+    // - Neuron 0 is in refractory period -> won't re-fire from its own spike
+    
+#if DEBUG_SPIKE_PROCESS
+    printf("[SNN-%u] Processing spike from node %u, neuron %u (global_id=0x%08lX)\n",
+           g_engine.node_id, source_node, source_local, source_id);
+#endif
+    
+    // Apply spike to all neurons with synapses from this source
     for (uint16_t i = 0; i < g_engine.neuron_count; i++) {
         z1_neuron_t* neuron = &g_engine.neurons[i];
         
@@ -217,10 +257,20 @@ static void process_spike(const z1_spike_t* spike) {
                 g_engine.stats.membrane_updates++;
                 
 #if DEBUG_SPIKE_PROCESS
-                printf("[SNN-%u] Spike %lu -> Neuron %u: V_mem += %.3f (now %.3f, threshold %.3f)\n",
+                printf("[SNN-%u] Synapse: Spike %lu -> Neuron %u: V_mem += %.3f (now %.3f, threshold %.3f)\n",
                        g_engine.node_id, source_id, neuron->neuron_id,
                        delta_v, neuron->membrane_potential, neuron->threshold);
 #endif
+                
+                // CRITICAL: Check threshold IMMEDIATELY after integration
+                // Reference: Python snn_engine.py line 246-249
+                if (neuron->membrane_potential >= neuron->threshold) {
+                    // Check refractory period
+                    if (g_engine.current_time_us >= neuron->refractory_until_us) {
+                        fire_neuron(neuron);
+                    }
+                    break;  // Stop processing remaining synapses for this neuron
+                }
             }
         }
     }
@@ -299,8 +349,8 @@ bool z1_snn_load_topology_from_psram(void) {
     
     g_engine.neuron_count = 0;
     
-    printf("[SNN-%u] Loading neuron table from PSRAM @ 0x%08lX...\n",
-           g_engine.node_id, psram_addr);
+    // printf("[SNN-%u] Loading neuron table from PSRAM @ 0x%08lX...\n",
+    //        g_engine.node_id, psram_addr);
     
     // Read neuron entries until end marker (neuron_id = 0xFFFF)
     for (uint16_t i = 0; i < Z1_SNN_MAX_NEURONS; i++) {
@@ -311,7 +361,7 @@ bool z1_snn_load_topology_from_psram(void) {
         uint16_t neuron_id;
         memcpy(&neuron_id, entry_buffer, 2);
         if (neuron_id == 0xFFFF) {
-            printf("[SNN-%u] Found end marker, table complete\n", g_engine.node_id);
+            // printf("[SNN-%u] Found end marker, table complete\n", g_engine.node_id);
             break;
         }
         
@@ -322,25 +372,26 @@ bool z1_snn_load_topology_from_psram(void) {
             return false;
         }
         
-        printf("[SNN-%u] Loaded neuron %u (global 0x%08lX): threshold=%.3f, leak=%.3f, synapses=%u\n",
-               g_engine.node_id, neuron->neuron_id, neuron->global_id,
-               neuron->threshold, neuron->leak_rate, neuron->synapse_count);
+        // printf("[SNN-%u] Loaded neuron %u (global 0x%08lX): threshold=%.3f, leak=%.3f, synapses=%u\n",
+        //        g_engine.node_id, neuron->neuron_id, neuron->global_id,
+        //        neuron->threshold, neuron->leak_rate, neuron->synapse_count);
         
         g_engine.neuron_count++;
         psram_addr += Z1_NEURON_ENTRY_SIZE;
     }
     
-    printf("[SNN-%u] Loaded %u neurons from PSRAM\n",
-           g_engine.node_id, g_engine.neuron_count);
+    // printf("[SNN-%u] Loaded %u neurons from PSRAM\n",
+    //        g_engine.node_id, g_engine.neuron_count);
     
     return g_engine.neuron_count > 0;
 }
 
 void z1_snn_start(void) {
     g_engine.running = true;
+    g_engine.paused = false;
     g_engine.current_time_us = 0;
     memset(&g_engine.stats, 0, sizeof(g_engine.stats));
-    printf("[SNN-%u] Started\n", g_engine.node_id);
+    // printf("[SNN-%u] Started\n", g_engine.node_id);
 }
 
 void z1_snn_stop(void) {
@@ -348,56 +399,52 @@ void z1_snn_stop(void) {
     printf("[SNN-%u] Stopped\n", g_engine.node_id);
 }
 
+void z1_snn_pause(void) {
+    g_engine.paused = true;
+}
+
+void z1_snn_resume(void) {
+    g_engine.paused = false;
+}
+
 void z1_snn_step(void) {
-    if (!g_engine.running) return;
+    if (!g_engine.running || g_engine.paused) return;
     
     // Update time
     g_engine.current_time_us += g_engine.timestep_us;
     g_engine.stats.simulation_steps++;
     
-    // Heartbeat every 10000 steps to confirm we're running
-    if (g_engine.stats.simulation_steps % 10000 == 0) {
-        printf("[SNN-%u] HEARTBEAT: step=%lu, queue=%u, neurons=%u\n",
-               g_engine.node_id, g_engine.stats.simulation_steps,
-               g_engine.spike_queue_size, g_engine.neuron_count);
-        
-        // Show neuron membrane potentials
-        for (uint16_t i = 0; i < g_engine.neuron_count; i++) {
-            printf("  Neuron %u: V=%.3f (threshold=%.3f)\n",
-                   g_engine.neurons[i].neuron_id,
-                   g_engine.neurons[i].membrane_potential,
-                   g_engine.neurons[i].threshold);
-        }
-    }
-    
     // Clear output spike buffer
     g_output_spike_count = 0;
     
-    // STEP 1: Process all queued spikes
+    // STEP 1: Process queued spikes (LIMITED to prevent blocking)
+    // If queue has more spikes, they'll be processed in next timestep
+    // This ensures the main loop can respond to controller queries
+    // After broker priority fix, commands can interrupt spike processing safely
+    const uint16_t MAX_SPIKES_PER_TIMESTEP = 100;
     z1_spike_t spike;
     uint16_t spikes_processed = 0;
-    while (spike_queue_pop(&spike)) {
+    while (spike_queue_pop(&spike) && spikes_processed < MAX_SPIKES_PER_TIMESTEP) {
         process_spike(&spike);
         spikes_processed++;
-    }
-    
-    if (spikes_processed > 0) {
-        printf("[SNN-%u] 🔄 PROCESSED %u spikes (queue was %u)\n", 
-               g_engine.node_id, spikes_processed, spikes_processed);
     }
     
     // STEP 2: Apply leak and check threshold (CRITICAL ORDER from working implementation)
     for (uint16_t i = 0; i < g_engine.neuron_count; i++) {
         z1_neuron_t* neuron = &g_engine.neurons[i];
         
-        // Apply leak (skip for input neurons - they have leak_rate=0.0)
+        // Apply leak - CRITICAL: leak_rate is RETENTION factor (what we KEEP, not what leaks)
+        // Formula: V_new = V_old * leak_rate
+        // E.g., leak_rate=0.95 means keep 95%, lose 5% per timestep
+        // Reference: Python snn_engine.py line 195: neuron.membrane_potential *= neuron.leak_rate
         if (neuron->membrane_potential > 0.0f && neuron->leak_rate > 0.0f) {
             neuron->membrane_potential *= neuron->leak_rate;
             g_engine.stats.membrane_updates++;
         }
         
-        // Check threshold AFTER leak (critical for proper firing)
-        // ALL neurons can fire, including input neurons
+        // Check threshold after leak (secondary check)
+        // This catches neurons that accumulated potential over multiple timesteps
+        // without receiving spikes. Most firing should happen during spike processing.
         if (neuron->membrane_potential >= neuron->threshold) {
             // Check refractory period
             if (g_engine.current_time_us >= neuron->refractory_until_us) {
@@ -407,6 +454,46 @@ void z1_snn_step(void) {
     }
 }
 
+/**
+ * Inject spike with immediate processing (for input neurons)
+ * Reference: Python snn_engine.py lines 137-163
+ * 
+ * This function directly adds to membrane potential and checks threshold,
+ * without queuing. Use this for controller-injected input spikes that should
+ * take effect immediately within the same timestep.
+ */
+bool z1_snn_inject_spike_immediate(uint16_t local_neuron_id, float value) {
+    if (local_neuron_id >= g_engine.neuron_count) {
+        return false;
+    }
+    
+    z1_neuron_t* neuron = &g_engine.neurons[local_neuron_id];
+    
+    // Add value to membrane potential
+    neuron->membrane_potential += value;
+    g_engine.stats.spikes_received++;
+    g_engine.stats.membrane_updates++;
+    
+#if DEBUG_SPIKE_PROCESS
+    printf("[SNN-%u] Inject immediate: Neuron %u, V_mem += %.3f (now %.3f, threshold %.3f)\n",
+           g_engine.node_id, local_neuron_id, value, 
+           neuron->membrane_potential, neuron->threshold);
+#endif
+    
+    // Check threshold IMMEDIATELY (Python behavior)
+    if (neuron->membrane_potential >= neuron->threshold) {
+        if (g_engine.current_time_us >= neuron->refractory_until_us) {
+            fire_neuron(neuron);
+        }
+    }
+    
+    return true;
+}
+
+/**
+ * Inject spike via queue (for network spikes)
+ * Use this for spikes received from other nodes via Matrix bus.
+ */
 bool z1_snn_inject_spike(z1_spike_t spike) {
     g_engine.stats.spikes_received++;
 #if DEBUG_SPIKE_QUEUE

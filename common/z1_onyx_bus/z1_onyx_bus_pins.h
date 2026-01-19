@@ -1,5 +1,6 @@
 /**
  * Z1 Onyx Bus - Pin Definitions
+ * Code by NeuroFab Corp: 2025-2026
  * 
  * Source-Synchronous Multi-Master Bus Protocol
  * RP2350 (Pico 2) - 26 pins via PCIe x4 connector

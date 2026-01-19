@@ -1,5 +1,6 @@
 /**
  * SSD1306 OLED Driver Implementation
+ * Code by NeuroFab Corp: 2025-2026
  */
 
 #include "ssd1306.h"

@@ -1,5 +1,6 @@
 /**
  * Z1 Onyx Cluster - SD Card Stub Interface
+ * Code by NeuroFab Corp: 2025-2026
  * 
  * Placeholder for SD card initialization.
  * Hardware: SPI1, MISO=40, CS=41, CLK=42, MOSI=43

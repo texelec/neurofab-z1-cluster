@@ -2,7 +2,14 @@
 """
 nflash - Flash firmware to Z1 compute nodes
 
-Utility for uploading and installing firmware on compute nodes.
+SD card-based firmware update using proven file upload infrastructure.
+Simpler and more reliable than HTTP-based OTA.
+
+Usage:
+    nflash node_app_16.bin -n 0              # Update node 0
+    nflash node_app_16.bin -n 0-3            # Update nodes 0-3
+    nflash node_app_16.bin -n all            # Update all nodes
+    nflash node_app_16.bin -n 0 --no-header # Flash raw binary (for testing)
 """
 
 import sys
@@ -10,354 +17,332 @@ import os
 import argparse
 import struct
 import time
+import requests
 from pathlib import Path
 
 # Add lib directory to path
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'lib'))
 
 from z1_client import Z1Client, Z1ClusterError
-from cluster_config import ClusterConfig
+
+# ANSI colors
+class Colors:
+    GREEN = '\033[92m'
+    YELLOW = '\033[93m'
+    RED = '\033[91m'
+    CYAN = '\033[96m'
+    RESET = '\033[0m'
+    BOLD = '\033[1m'
 
 
 def calculate_crc32(data):
-    """Calculate CRC32 checksum."""
-    import zlib
-    return zlib.crc32(data) & 0xFFFFFFFF
+    """Calculate CRC32 (IEEE 802.3, matches bootloader)"""
+    crc = 0xFFFFFFFF
+    
+    for byte in data:
+        crc ^= byte
+        for _ in range(8):
+            if crc & 1:
+                crc = (crc >> 1) ^ 0xEDB88320
+            else:
+                crc >>= 1
+    
+    return (~crc) & 0xFFFFFFFF
 
 
-def create_firmware_header(firmware_data, name, version, capabilities=0):
+def create_app_header(binary_data, name="Z1 Node App", version=(1, 0, 0)):
     """
-    Create firmware header for Z1 bootloader.
+    Create 192-byte app header for Z1 bootloader.
+    
+    Matches bootloader's app_header_t structure:
+    - 32 bytes: metadata (magic, version, flags, size, crc, entry)
+    - 32 bytes: name
+    - 64 bytes: description
+    - 64 bytes: reserved
+    """
+    magic = 0x5A314150  # "Z1AP"
+    version_major, version_minor, version_patch = version
+    flags = 0
+    binary_size = len(binary_data)
+    crc32 = calculate_crc32(binary_data)
+    entry_point = 0xC0  # Standard RP2350 entry point offset
+    
+    # Pack metadata (32 bytes)
+    header = struct.pack('<IIIIIIII',
+        magic,           # 0: magic
+        version_major,   # 4: version_major  
+        version_minor,   # 8: version_minor
+        version_patch,   # 12: version_patch
+        flags,           # 16: flags
+        binary_size,     # 20: binary_size
+        crc32,           # 24: crc32
+        entry_point      # 28: entry_point
+    )
+    
+    # Add name (32 bytes, null-terminated)
+    name_bytes = name.encode('utf-8')[:31] + b'\x00'
+    name_bytes += b'\x00' * (32 - len(name_bytes))
+    header += name_bytes
+    
+    # Add description (64 bytes, null-terminated)
+    description = "Z1 Node Firmware - Dual-partition bootloader compatible"
+    desc_bytes = description.encode('utf-8')[:63] + b'\x00'
+    desc_bytes += b'\x00' * (64 - len(desc_bytes))
+    header += desc_bytes
+    
+    # Add reserved (64 bytes)
+    header += b'\x00' * 64
+    
+    assert len(header) == 192, f"Header must be 192 bytes, got {len(header)}"
+    
+    return header, crc32
+
+
+def prepare_firmware(binary_path, add_header=True):
+    """Read binary and optionally prepend Z1 header."""
+    print(f"{Colors.CYAN}Preparing firmware...{Colors.RESET}")
+    
+    with open(binary_path, 'rb') as f:
+        binary_data = f.read()
+    
+    print(f"  Binary size: {len(binary_data):,} bytes")
+    
+    # Auto-detect if binary already has Z1 header (check magic number)
+    has_header = False
+    if len(binary_data) >= 4:
+        magic = struct.unpack('<I', binary_data[0:4])[0]
+        if magic == 0x5A314150:
+            has_header = True
+            print(f"  {Colors.YELLOW}Detected existing Z1 header (magic 0x5A314150){Colors.RESET}")
+    
+    if add_header and not has_header:
+        header, crc32 = create_app_header(binary_data, name=binary_path.stem)
+        firmware = header + binary_data
+        print(f"  Header: 192 bytes")
+        print(f"  Magic: 0x5A314150")
+        print(f"  Version: 1.0.0")
+        print(f"  Binary size: {len(binary_data)} bytes")
+        print(f"  CRC32: 0x{crc32:08X}")
+        print(f"  Entry point: 0x000000C0")
+        print(f"Output binary: {len(firmware)} bytes")
+        return firmware, crc32
+    elif has_header:
+        # Binary already has header, extract CRC from it
+        print(f"  {Colors.GREEN}Using existing header (no double-header){Colors.RESET}")
+        crc32 = struct.unpack('<I', binary_data[24:28])[0]
+        print(f"  CRC32: 0x{crc32:08X}")
+        print(f"Output binary: {len(binary_data)} bytes")
+        return binary_data, crc32
+    else:
+        print(f"  {Colors.YELLOW}WARNING: Flashing raw binary (no header){Colors.RESET}")
+        return binary_data, 0
+
+def flash_node_from_sd(controller_ip, node_id, filepath, timeout=120):
+    """
+    Trigger SD card-based firmware update for a node.
     
     Args:
-        firmware_data: Raw firmware binary
-        name: Firmware name (max 31 chars)
-        version: Version string (max 15 chars)
-        capabilities: Capability flags
+        controller_ip: Controller IP address
+        node_id: Target node ID (0-15)
+        filepath: Path to firmware on SD card (e.g., "firmware/app.bin")
+        timeout: Update timeout in seconds
         
     Returns:
-        Complete firmware image with header
+        dict: Update result with status, bytes_sent, chunks, time_ms
     """
-    FIRMWARE_MAGIC = 0x4E465A31  # "NFZ1"
-    FIRMWARE_VERSION = 1
+    url = f'http://{controller_ip}/api/nodes/{node_id}/update'
+    payload = {'filepath': filepath}
     
-    # Calculate CRC32 of firmware code
-    crc32 = calculate_crc32(firmware_data)
+    try:
+        response = requests.post(url, json=payload, timeout=timeout)
+        
+        if response.status_code != 200:
+            return {
+                'error': f'HTTP {response.status_code}: {response.text}'
+            }
+        
+        return response.json()
+        
+    except requests.exceptions.Timeout:
+        return {'error': f'Timeout after {timeout}s'}
+    except Exception as e:
+        return {'error': str(e)}
+
+
+def upload_firmware_to_sd(controller_ip, firmware_data, sd_path):
+    """
+    Upload firmware to controller's SD card using file upload API.
     
-    # Build header (256 bytes)
-    header = bytearray(256)
+    Args:
+        controller_ip: Controller IP address
+        firmware_data: Binary firmware data (with header)
+        sd_path: Destination path on SD card (e.g., "firmware/app.bin")
+        
+    Returns:
+        bool: True if upload succeeded
+    """
+    url = f'http://{controller_ip}/api/files/{sd_path}'
     
-    struct.pack_into('<I', header, 0, FIRMWARE_MAGIC)  # magic
-    struct.pack_into('<I', header, 4, FIRMWARE_VERSION)  # version
-    struct.pack_into('<I', header, 8, len(firmware_data))  # firmware_size
-    struct.pack_into('<I', header, 12, 0x100)  # entry_point (offset from APP_BASE)
-    struct.pack_into('<I', header, 16, crc32)  # crc32
-    struct.pack_into('<I', header, 20, int(time.time()))  # timestamp
-    
-    # Name (32 bytes, null-terminated)
-    name_bytes = name.encode('utf-8')[:31]
-    header[24:24+len(name_bytes)] = name_bytes
-    
-    # Version string (16 bytes, null-terminated)
-    version_bytes = version.encode('utf-8')[:15]
-    header[56:56+len(version_bytes)] = version_bytes
-    
-    # Capabilities
-    struct.pack_into('<I', header, 72, capabilities)
-    
-    # Combine header + firmware
-    return bytes(header) + firmware_data
+    try:
+        print(f"  Uploading to SD card: {sd_path}")
+        print(f"  Size: {len(firmware_data):,} bytes")
+        
+        response = requests.put(url, data=firmware_data, timeout=30)
+        
+        if response.status_code != 200:
+            print(f"  {Colors.RED}✗ Upload failed: HTTP {response.status_code}{Colors.RESET}")
+            print(f"  Response: {response.text}")
+            return False
+        
+        result = response.json()
+        if result.get('success'):
+            print(f"  {Colors.GREEN}✓ Uploaded successfully{Colors.RESET}")
+            return True
+        else:
+            print(f"  {Colors.RED}✗ Upload failed{Colors.RESET}")
+            return False
+            
+    except Exception as e:
+        print(f"  {Colors.RED}✗ Upload error: {e}{Colors.RESET}")
+        return False
 
 
 def flash_firmware(args):
-    """Flash firmware to node(s)."""
-    # Load firmware file
+    """Main firmware flash function using SD card-based OTA."""
+    # Load and prepare firmware
     firmware_path = Path(args.firmware)
     if not firmware_path.exists():
-        print(f"Error: Firmware file not found: {firmware_path}", file=sys.stderr)
+        print(f"{Colors.RED}Error: Firmware file not found: {firmware_path}{Colors.RESET}")
         return 1
     
-    with open(firmware_path, 'rb') as f:
-        firmware_data = f.read()
+    firmware_data, crc32 = prepare_firmware(firmware_path, add_header=not args.no_header)
     
-    print(f"Loaded firmware: {firmware_path.name} ({len(firmware_data)} bytes)")
+    print()
+    print("=" * 70)
+    print(f"{Colors.BOLD}Z1 Onyx Firmware Flash (SD-based OTA){Colors.RESET}")
+    print("=" * 70)
+    print()
     
-    # Create firmware header
-    name = args.name or firmware_path.stem
-    version = args.version or "1.0.0"
-    
-    # Determine capabilities from firmware name
-    capabilities = 0
-    if 'snn' in name.lower():
-        capabilities |= 0x00000001  # FW_CAP_SNN
-    elif 'matrix' in name.lower():
-        capabilities |= 0x00000002  # FW_CAP_MATRIX
-    elif 'signal' in name.lower():
-        capabilities |= 0x00000004  # FW_CAP_SIGNAL
+    # Parse node targets
+    node_ids = []
+    if args.nodes == 'all':
+        node_ids = list(range(16))
+    elif '-' in args.nodes:
+        start, end = map(int, args.nodes.split('-'))
+        node_ids = list(range(start, end + 1))
+    elif ',' in args.nodes:
+        node_ids = [int(n.strip()) for n in args.nodes.split(',')]
     else:
-        capabilities |= 0x80000000  # FW_CAP_CUSTOM
+        node_ids = [int(args.nodes)]
     
-    firmware_image = create_firmware_header(firmware_data, name, version, capabilities)
+    controller_ip = args.controller
     
-    print(f"Firmware image: {len(firmware_image)} bytes")
-    print(f"  Name: {name}")
-    print(f"  Version: {version}")
-    print(f"  CRC32: 0x{calculate_crc32(firmware_data):08X}")
+    print(f"Controller: {controller_ip}")
+    print(f"Target nodes: {node_ids}")
+    print(f"Firmware: {firmware_path.name} ({len(firmware_data):,} bytes)")
+    if not args.no_header:
+        print(f"CRC32: 0x{crc32:08X}")
+    print()
     
-    # Parse target nodes
-    targets = parse_targets(args.target)
+    # Step 1: Upload firmware to SD card
+    sd_path = args.sd_path or f"firmware/{firmware_path.name}"
     
-    if not targets:
-        print("Error: No valid targets specified", file=sys.stderr)
+    print(f"{Colors.CYAN}[1/2] Uploading firmware to controller SD card...{Colors.RESET}")
+    if not upload_firmware_to_sd(controller_ip, firmware_data, sd_path):
+        print(f"\n{Colors.RED}✗ Failed to upload firmware to SD card{Colors.RESET}")
         return 1
     
-    print(f"\nFlashing {len(targets)} node(s)...")
+    print()
     
-    # Flash each target
+    # Step 2: Flash each node from SD card
+    print(f"{Colors.CYAN}[2/2] Flashing nodes from SD card...{Colors.RESET}")
+    
     success_count = 0
     failed_nodes = []
     
-    for backplane, node_id in targets:
-        target_name = f"{backplane or 'default'}:{node_id}"
+    for node_id in node_ids:
+        print(f"\n{Colors.BOLD}Node {node_id}:{Colors.RESET}")
         
-        try:
-            # Get controller IP
-            if backplane:
-                config = ClusterConfig(args.config)
-                bp = config.get_backplane(backplane)
-                if not bp:
-                    print(f"  {target_name}: Backplane not found", file=sys.stderr)
-                    failed_nodes.append((target_name, "Backplane not found"))
-                    continue
-                controller_ip = bp.controller_ip
-                controller_port = bp.controller_port
-            else:
-                config = ClusterConfig(args.config)
-                bp = config.get_default_backplane()
-                controller_ip = args.controller or bp.controller_ip
-                controller_port = bp.controller_port
-            
-            # Create client and test connection
-            try:
-                client = Z1Client(controller_ip=controller_ip, port=controller_port)
-            except Exception as e:
-                print(f"  {target_name}: Failed to connect to controller at {controller_ip}:{controller_port}", file=sys.stderr)
-                print(f"    Error: {e}", file=sys.stderr)
-                failed_nodes.append((target_name, f"Connection failed: {e}"))
-                continue
-            
-            # Upload firmware to buffer (address 0x10020000)
-            FIRMWARE_BUFFER_ADDR = 0x10020000
-            
-            print(f"  {backplane or 'default'}:{node_id}: Uploading firmware...")
-            bytes_written = client.write_memory(node_id, FIRMWARE_BUFFER_ADDR, firmware_image)
-            
-            if bytes_written != len(firmware_image):
-                print(f"    ERROR: Only {bytes_written}/{len(firmware_image)} bytes written")
-                continue
-            
-            # Verify firmware
-            print(f"  {backplane or 'default'}:{node_id}: Verifying...")
-            # (Would call verify endpoint)
-            
-            # Install firmware
-            print(f"  {backplane or 'default'}:{node_id}: Installing...")
-            # (Would call install endpoint)
-            
-            # Activate and reboot
-            if not args.no_reboot:
-                print(f"  {backplane or 'default'}:{node_id}: Rebooting...")
-                # (Would call reboot endpoint)
-            
-            print(f"  {backplane or 'default'}:{node_id}: ✓ Success")
-            success_count += 1
-            
-        except Exception as e:
-            print(f"  {target_name}: ERROR - {e}", file=sys.stderr)
-            failed_nodes.append((target_name, str(e)))
-    
-    print(f"\nFlashed {success_count}/{len(targets)} node(s) successfully")
-    
-    if failed_nodes:
-        print(f"\nFailed nodes:")
-        for target_name, error in failed_nodes:
-            print(f"  {target_name}: {error}")
-    
-    return 0 if success_count == len(targets) else 1
-
-
-def info_firmware(args):
-    """Get firmware information from node(s)."""
-    targets = parse_targets(args.target)
-    
-    if not targets:
-        print("Error: No valid targets specified", file=sys.stderr)
-        return 1
-    
-    print(f"Firmware Information:")
-    print("=" * 80)
-    
-    for backplane, node_id in targets:
-        try:
-            # Get controller IP
-            if backplane:
-                config = ClusterConfig(args.config)
-                bp = config.get_backplane(backplane)
-                if not bp:
-                    continue
-                controller_ip = bp.controller_ip
-            else:
-                controller_ip = args.controller
-            
-            client = Z1Client(controller_ip=controller_ip)
-            
-            # Get firmware info (would use dedicated endpoint)
-            # For now, read header from application slot
-            APP_BASE = 0x10004000
-            header_data = client.read_memory(node_id, APP_BASE, 256)
-            
-            # Parse header
-            magic, version, fw_size, entry, crc32, timestamp = struct.unpack_from('<6I', header_data, 0)
-            name = header_data[24:56].decode('utf-8', errors='ignore').rstrip('\x00')
-            ver_str = header_data[56:72].decode('utf-8', errors='ignore').rstrip('\x00')
-            
-            print(f"\n{backplane or 'default'}:{node_id}")
-            if magic == 0x4E465A31:
-                print(f"  Name:      {name}")
-                print(f"  Version:   {ver_str}")
-                print(f"  Size:      {fw_size} bytes")
-                print(f"  CRC32:     0x{crc32:08X}")
-                print(f"  Timestamp: {time.ctime(timestamp)}")
-            else:
-                print(f"  No valid firmware installed")
-            
-        except Exception as e:
-            print(f"\n{backplane or 'default'}:{node_id}")
-            print(f"  ERROR: {e}")
-    
-    return 0
-
-
-def parse_targets(target_spec):
-    """
-    Parse target specification.
-    
-    Formats:
-        "5" - Node 5 on default backplane
-        "backplane-0:5" - Node 5 on backplane-0
-        "all" - All nodes on all backplanes
-        "backplane-0:all" - All nodes on backplane-0
+        start_time = time.time()
+        result = flash_node_from_sd(controller_ip, node_id, sd_path, timeout=120)
+        elapsed = time.time() - start_time
         
-    Returns:
-        List of (backplane, node_id) tuples
-    """
-    targets = []
-    
-    if target_spec == "all":
-        # All nodes on all backplanes
-        config = ClusterConfig()
-        for bp in config.backplanes:
-            for node_id in range(bp.node_count):
-                targets.append((bp.name, node_id))
-    
-    elif ":" in target_spec:
-        # Backplane:node format
-        backplane, node_str = target_spec.split(":", 1)
-        
-        if node_str == "all":
-            # All nodes on specified backplane
-            config = ClusterConfig()
-            bp = config.get_backplane(backplane)
-            if bp:
-                for node_id in range(bp.node_count):
-                    targets.append((backplane, node_id))
+        if 'error' in result:
+            print(f"  {Colors.RED}✗ Flash failed: {result['error']}{Colors.RESET}")
+            failed_nodes.append(node_id)
         else:
-            # Specific node
-            try:
-                node_id = int(node_str)
-                targets.append((backplane, node_id))
-            except ValueError:
-                pass
+            bytes_sent = result.get('bytes_sent', 0)
+            chunks = result.get('chunks', 0)
+            time_ms = result.get('time_ms', int(elapsed * 1000))
+            
+            print(f"  {Colors.GREEN}✓ Flash successful{Colors.RESET}")
+            print(f"  Bytes sent: {bytes_sent:,}")
+            print(f"  Chunks: {chunks}")
+            print(f"  Time: {time_ms / 1000:.1f}s")
+            
+            if bytes_sent > 0:
+                throughput_kbps = (bytes_sent * 8) / (time_ms / 1000) / 1000
+                print(f"  Throughput: {throughput_kbps:.1f} Kbps")
+            
+            success_count += 1
     
-    else:
-        # Just node number (default backplane)
-        try:
-            node_id = int(target_spec)
-            targets.append((None, node_id))
-        except ValueError:
-            pass
+    # Summary
+    print()
+    print("=" * 70)
+    print(f"{Colors.BOLD}Flash Summary{Colors.RESET}")
+    print("=" * 70)
+    print()
+    print(f"Total nodes: {len(node_ids)}")
+    print(f"{Colors.GREEN}Success: {success_count}{Colors.RESET}")
+    if failed_nodes:
+        print(f"{Colors.RED}Failed: {len(failed_nodes)}{Colors.RESET}")
+        print(f"  Failed nodes: {failed_nodes}")
+    print()
     
-    return targets
+    return 0 if len(failed_nodes) == 0 else 1
 
 
 def main():
     parser = argparse.ArgumentParser(
-        description='Flash firmware to Z1 compute nodes',
+        description='Flash firmware to Z1 Onyx compute nodes via SD card',
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
-Commands:
-  flash FIRMWARE TARGET     Flash firmware to node(s)
-  info TARGET               Get firmware information
-
-Target Formats:
-  5                         Node 5 on default backplane
-  backplane-0:5             Node 5 on backplane-0
-  all                       All nodes on all backplanes
-  backplane-0:all           All nodes on backplane-0
-
 Examples:
-  nflash flash snn_firmware.bin 0              Flash to node 0
-  nflash flash snn_firmware.bin all            Flash to all nodes
-  nflash flash custom.bin backplane-1:5        Flash to specific node
-  nflash info all                              Get firmware info from all nodes
-        """
+  # Flash single node
+  nflash firmware.bin -n 0 -c 192.168.1.201
+  
+  # Flash multiple nodes
+  nflash firmware.bin -n 0,1,2,3 -c 192.168.1.201
+  
+  # Flash node range
+  nflash firmware.bin -n 0-7 -c 192.168.1.201
+  
+  # Flash all nodes
+  nflash firmware.bin -n all -c 192.168.1.201
+  
+  # Flash without adding header (already has one)
+  nflash firmware_with_header.bin -n 0 -c 192.168.1.201 --no-header
+  
+  # Custom SD card path
+  nflash firmware.bin -n 0 -c 192.168.1.201 --sd-path firmware/custom.bin
+"""
     )
     
-    parser.add_argument('command',
-                       choices=['flash', 'info'],
-                       help='Command to execute')
-    parser.add_argument('firmware',
-                       nargs='?',
-                       help='Firmware file (for flash command)')
-    parser.add_argument('target',
-                       nargs='?',
-                       help='Target node(s)')
-    parser.add_argument('-c', '--controller',
-                       default=None,
-                       help='Controller IP (default backplane)')
-    parser.add_argument('--config',
-                       help='Cluster configuration file')
-    parser.add_argument('--name',
-                       help='Firmware name (default: filename)')
-    parser.add_argument('--version',
-                       default='1.0.0',
-                       help='Firmware version (default: 1.0.0)')
-    parser.add_argument('--no-reboot',
-                       action='store_true',
-                       help='Do not reboot after flashing')
+    parser.add_argument('firmware', help='Firmware binary file to flash')
+    parser.add_argument('-n', '--nodes', default='0', 
+                        help='Target nodes: single (0), range (0-7), list (0,1,2), or "all"')
+    parser.add_argument('-c', '--controller', required=True,
+                        help='Controller IP address')
+    parser.add_argument('--no-header', action='store_true',
+                        help='Do not add app header (firmware already has one)')
+    parser.add_argument('--sd-path', default=None,
+                        help='Custom SD card path (default: firmware/<filename>)')
     
     args = parser.parse_args()
     
-    try:
-        if args.command == 'flash':
-            if not args.firmware or not args.target:
-                print("Error: flash requires firmware file and target", file=sys.stderr)
-                return 1
-            return flash_firmware(args)
-        
-        elif args.command == 'info':
-            if not args.target:
-                # Default to all nodes
-                args.target = 'all'
-            return info_firmware(args)
-    
-    except Z1ClusterError as e:
-        print(f"Error: {e}", file=sys.stderr)
-        return 1
-    except KeyboardInterrupt:
-        print("\nInterrupted", file=sys.stderr)
-        return 130
+    return flash_firmware(args)
 
 
 if __name__ == '__main__':
     sys.exit(main())
+

@@ -1,5 +1,6 @@
 /**
  * Core Queue - Thread-Safe Inter-Core Communication
+ * Code by NeuroFab Corp: 2025-2026
  * 
  * Lock-free FIFO queue for passing frames between RP2350 cores.
  * Uses atomic operations for head/tail pointers (no mutex overhead).

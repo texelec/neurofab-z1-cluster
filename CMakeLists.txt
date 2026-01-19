@@ -14,8 +14,10 @@ set(PICO_BOARD pico2 CACHE STRING "Board type")
 # Pull in Pico SDK (must be before project)
 include($ENV{PICO_SDK_PATH}/external/pico_sdk_import.cmake)
 
-# Build picotool but skip the test that crashes
-set(PICOTOOL_TEST OFF CACHE BOOL "Disable picotool version test")
+# Use our pre-built picotool.exe that doesn't crash
+set(picotool_FOUND TRUE)
+set(PICOTOOL_EXECUTABLE "${CMAKE_SOURCE_DIR}/build_tools/picotool.exe" CACHE FILEPATH "Path to picotool")
+set(PICOTOOL_TEST OFF CACHE BOOL "Disable picotool version test" FORCE)
 
 project(z1_onyx_cluster C CXX ASM)
 set(CMAKE_C_STANDARD 11)
@@ -42,8 +44,13 @@ add_subdirectory(common/z1_broker)
 add_subdirectory(common/z1_commands)
 add_subdirectory(common/psram)
 add_subdirectory(common/oled)
+add_subdirectory(common/FatFs_SPI)
 add_subdirectory(common/sd_card)
+
+# Bootloader (Phase 1: OTA dual-partition firmware)
+add_subdirectory(bootloader)
 
 # Controller and Node projects
 add_subdirectory(controller)
 add_subdirectory(node)
+

@@ -1,6 +1,27 @@
 # Build directories - contain generated files with system-specific paths
-build/
+build/*
+!build/.gitkeep
 build_backup/
+picotool_build/
+
+# Build tools artifacts (CMake and Ninja generated files)
+build_tools/.ninja_log
+build_tools/cmake_install.cmake
+build_tools/pico-sdk/
+build_tools/_deps/
+build_tools/generated/
+build_tools/pioasm/
+build_tools/pioasm-install/
+build_tools/__pycache__/
+
+# Environment setup script - contains system-specific paths
+setup_build_env.ps1
+
+# Backup directory - external backups managed by backup.py
+Backups/
+
+# Local documentation - changelogs, debug logs, internal notes
+documentation/localonly/
 
 # Firmware binaries (optional - can commit final releases)
 # Uncomment the following lines if you don't want to commit compiled binaries

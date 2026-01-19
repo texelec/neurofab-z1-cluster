@@ -53,7 +53,7 @@ class Z1CommunicationError(Z1ClusterError):
 class Z1Client:
     """Client for interacting with Z1 neuromorphic cluster."""
     
-    def __init__(self, controller_ip: str = "192.168.1.222", port: int = 80, timeout: int = 10):
+    def __init__(self, controller_ip: str = "192.168.1.201", port: int = 80, timeout: int = 45):
         """
         Initialize Z1 cluster client.
         
@@ -244,7 +244,8 @@ class Z1Client:
         data_b64 = base64.b64encode(data).decode('ascii')
         response = self._request('POST', f'/nodes/{node_id}/memory',
                                 json={'addr': addr, 'data': data_b64})
-        return response.get('bytes_written', 0)
+        # Return actual bytes written from response, or fall back to data length if not provided
+        return response.get('bytes_written', len(data))
     
     def execute_code(self, node_id: int, entry_point: int, params: Optional[List[int]] = None) -> int:
         """

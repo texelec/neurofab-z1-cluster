@@ -1,5 +1,6 @@
 /**
  * Z1 Onyx Controller - Hardware Pin Definitions
+ * Code by NeuroFab Corp: 2025-2026
  * 
  * Hardware variant selector - includes appropriate pin configuration
  */

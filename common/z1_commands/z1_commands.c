@@ -1,5 +1,6 @@
 /**
  * Z1 Command Layer Implementation
+ * Code by NeuroFab Corp: 2025-2026
  * 
  * Thin wrapper over existing broker/bus - NO timing impact
  */

@@ -1,13 +1,12 @@
 /**
  * Z1 Neuromorphic Cluster - Command Protocol Definitions
+ * Code by NeuroFab Corp: 2025-2026
  * 
  * CTRL frame opcodes and payload structures for node management,
  * memory operations, and SNN control over the production bus.
  * 
  * Protocol: CTRL frames use Type=CTRL (0b11), with opcode in payload[0]
  * Streams are used to separate command categories for priority routing.
- * 
- * Copyright NeuroFab Corp. All rights reserved.
  */
 
 #ifndef Z1_COMMANDS_H
@@ -77,10 +76,20 @@
 #define OPCODE_GET_SNN_STATUS   0x32  // Get execution status and statistics
 #define OPCODE_READ_SPIKE_LOG   0x33  // Read spike event log
 #define OPCODE_RESET_STATS      0x34  // Reset statistics counters
+#define OPCODE_PAUSE_SNN        0x35  // Pause SNN (freeze timestep, keep state)
+#define OPCODE_RESUME_SNN       0x36  // Resume SNN from pause
+#define OPCODE_INJECT_SPIKE_BATCH 0x37  // Inject batch of spikes (payload: count, then pairs of neuron_id words)
+#define OPCODE_RESET_TO_BOOTLOADER 0x38  // Reset node into bootloader mode (watchdog reboot)
+#define OPCODE_BOOTLOADER_BOOT_NOW 0x39  // Skip bootloader delay and boot to app immediately (broadcast)
 
 // Responses
 #define OPCODE_SNN_STATUS       0xB0  // SNN status response
 #define OPCODE_SPIKE_LOG_DATA   0xB1  // Spike log data
+
+// ============================================================================
+// NOTE: OTA Firmware Update Opcodes are defined in z1_bus.h
+// Z1_OPCODE_UPDATE_MODE_ENTER, Z1_OPCODE_UPDATE_DATA_CHUNK, etc.
+// ============================================================================
 
 // ============================================================================
 // Command Payload Structures

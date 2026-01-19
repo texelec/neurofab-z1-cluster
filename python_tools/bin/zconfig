@@ -1,0 +1,308 @@
+#!/usr/bin/env python3
+"""
+Z1 Onyx Configuration Tool
+Modify z1.cfg network settings and optionally trigger reboot
+"""
+
+import argparse
+import sys
+import time
+import requests
+from pathlib import Path
+
+# Add lib to path
+sys.path.insert(0, str(Path(__file__).parent.parent / 'lib'))
+from z1_client import Z1Client
+
+# MAC prefix for Z1 Onyx (locally administered)
+MAC_PREFIX = "02:5A:31"
+
+
+def parse_ip(ip_str):
+    """Parse IP address string to 4-byte array"""
+    parts = ip_str.split('.')
+    if len(parts) != 4:
+        raise ValueError(f"Invalid IP address: {ip_str}")
+    try:
+        octets = [int(p) for p in parts]
+        if any(o < 0 or o > 255 for o in octets):
+            raise ValueError(f"IP octet out of range: {ip_str}")
+        return octets
+    except ValueError:
+        raise ValueError(f"Invalid IP address: {ip_str}")
+
+
+def parse_mac(mac_str):
+    """Parse MAC address suffix (last 3 bytes) and prepend Z1 prefix"""
+    # Z1 Onyx MAC prefix: 02:5A:31 (locally administered)
+    prefix_bytes = [0x02, 0x5A, 0x31]
+    
+    # Support formats: DD:EE:FF or DD-EE-FF (last 3 bytes only)
+    parts = mac_str.replace('-', ':').split(':')
+    if len(parts) != 3:
+        raise ValueError(f"Invalid MAC suffix: {mac_str}. Provide last 3 bytes only (e.g., C3:D4:01)")
+    try:
+        suffix_bytes = [int(p, 16) for p in parts]
+        if any(b < 0 or b > 255 for b in suffix_bytes):
+            raise ValueError(f"MAC byte out of range: {mac_str}")
+        # Return full MAC with Z1 prefix
+        return prefix_bytes + suffix_bytes
+    except ValueError:
+        raise ValueError(f"Invalid MAC suffix: {mac_str}. Use hex format (e.g., C3:D4:01)")
+
+
+def format_ip(ip_bytes):
+    """Format IP bytes as string"""
+    return '.'.join(str(b) for b in ip_bytes)
+
+
+def format_mac(mac_bytes):
+    """Format MAC bytes as string"""
+    return ':'.join(f'{b:02X}' for b in mac_bytes)
+
+
+def parse_ini_config(content):
+    """Parse INI-style config file"""
+    config = {
+        'network': {},
+        'system': {}
+    }
+    current_section = None
+    
+    for line in content.split('\n'):
+        line = line.strip()
+        if not line or line.startswith('#'):
+            continue
+        
+        if line.startswith('[') and line.endswith(']'):
+            current_section = line[1:-1]
+            continue
+        
+        if '=' in line and current_section:
+            key, value = line.split('=', 1)
+            config[current_section][key.strip()] = value.strip()
+    
+    return config
+
+
+def format_ini_config(config):
+    """Format config dict as INI string"""
+    lines = []
+    for section, values in config.items():
+        lines.append(f'[{section}]')
+        for key, value in values.items():
+            lines.append(f'{key}={value}')
+        lines.append('')  # Blank line between sections
+    return '\n'.join(lines)
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description='Modify Z1 Onyx network configuration',
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  # Change IP address and reboot
+  zconfig --ip 192.168.1.100 --reboot
+  
+  # Change MAC suffix and reboot (prefix 02:5A:31 is automatic)
+  zconfig --mac C3:D4:05 --reboot
+  
+  # Change both IP and MAC suffix
+  zconfig --ip 192.168.1.100 --mac C3:D4:05 --reboot
+  
+  # Set engine type (no reboot)
+  zconfig --engine iaf
+  
+  # Show current config
+  zconfig --show
+
+Note: MAC address prefix 02:5A:31 is fixed (locally administered).
+      You can only set the last 3 bytes (e.g., C3:D4:05).
+        """
+    )
+    
+    parser.add_argument('-c', '--controller', default='192.168.1.222',
+                        help='Controller IP address (default: 192.168.1.222)')
+    parser.add_argument('--ip', help='New IP address (e.g., 192.168.1.100)')
+    parser.add_argument('--mac', help='New MAC suffix - last 3 bytes only (e.g., C3:D4:05). Prefix 02:5A:31 is fixed.')
+    parser.add_argument('--engine', help='SNN engine type (iaf, lif, adaptive)')
+    parser.add_argument('--reboot', action='store_true', help='Reboot after config change')
+    parser.add_argument('--show', action='store_true', help='Show current config and exit')
+    parser.add_argument('--wait', type=int, default=5,
+                        help='Seconds to wait after reboot (default: 5)')
+    
+    args = parser.parse_args()
+    
+    # Connect to controller
+    print(f"Connecting to controller at {args.controller}...")
+    z1 = Z1Client(args.controller)
+    
+    # Show current config if requested
+    if args.show:
+        try:
+            response = requests.get(f'http://{args.controller}/api/config', timeout=2)
+            if response.status_code == 200:
+                config = response.json()
+                print("\nCurrent Configuration:")
+                print(f"  IP Address: {config.get('ip_address', 'unknown')}")
+                print(f"  MAC Address: {config.get('mac_address', 'unknown')}")
+                print(f"  Engine: {config.get('current_engine', 'unknown')}")
+                print(f"  Hardware Version: {config.get('hw_version', 'unknown')}")
+                print(f"  Node Count: {config.get('node_count', 'unknown')}")
+                return 0
+            else:
+                print(f"Error: Failed to get config (HTTP {response.status_code})")
+                return 1
+        except Exception as e:
+            print(f"Error: {e}")
+            return 1
+    
+    # Check if any changes requested
+    if not args.ip and not args.mac and not args.engine:
+        parser.print_help()
+        return 0
+    
+    # Download current config or create default
+    print("Downloading current config...")
+    try:
+        response = requests.get(f'http://{args.controller}/api/config', timeout=2)
+        if response.status_code == 200:
+            # Parse from API response
+            api_config = response.json()
+            config = {
+                'network': {
+                    'ip': api_config.get('ip_address', '192.168.1.222'),
+                    'mac': api_config.get('mac_address', '02:5A:31:C3:D4:01')
+                },
+                'system': {
+                    'engine': api_config.get('current_engine', 'iaf'),
+                    'hw_version': str(api_config.get('hw_version', 2)),
+                    'node_count': str(api_config.get('node_count', 16))
+                }
+            }
+            print("✓ Config loaded from controller")
+        else:
+            print(f"Warning: Could not load config (HTTP {response.status_code})")
+            print("Using defaults...")
+            config = {
+                'network': {'ip': '192.168.1.222', 'mac': '02:5A:31:C3:D4:01'},
+                'system': {'engine': 'iaf', 'hw_version': '2', 'node_count': '16'}
+            }
+        
+    except Exception as e:
+        print(f"Warning: {e}")
+        print("Using defaults...")
+        config = {
+            'network': {'ip': '192.168.1.222', 'mac': '02:5A:31:C3:D4:01'},
+            'system': {'engine': 'iaf', 'hw_version': '2', 'node_count': '16'}
+        }
+    
+    # Apply changes
+    changes = []
+    
+    if args.ip:
+        try:
+            ip_bytes = parse_ip(args.ip)
+            config['network']['ip'] = format_ip(ip_bytes)
+            changes.append(f"IP: {config['network']['ip']}")
+        except ValueError as e:
+            print(f"Error: {e}")
+            return 1
+    
+    if args.mac:
+        try:
+            mac_bytes = parse_mac(args.mac)
+            config['network']['mac'] = format_mac(mac_bytes)
+            changes.append(f"MAC: {config['network']['mac']}")
+        except ValueError as e:
+            print(f"Error: {e}")
+            return 1
+    
+    if args.engine:
+        config['system']['engine'] = args.engine
+        changes.append(f"Engine: {args.engine}")
+    
+    print(f"Applying changes: {', '.join(changes)}")
+    
+    # Upload modified config
+    print("Uploading new config...")
+    try:
+        new_content = format_ini_config(config)
+        response = requests.put(
+            f'http://{args.controller}/api/files/z1.cfg',
+            data=new_content,
+            headers={'Content-Type': 'text/plain'},
+            timeout=5
+        )
+        
+        if response.status_code != 200:
+            print(f"Error: Failed to upload config (HTTP {response.status_code})")
+            print(f"Response: {response.text}")
+            return 1
+        
+        print("✓ Config updated successfully")
+        
+    except Exception as e:
+        print(f"Error uploading config: {e}")
+        return 1
+    
+    # Reboot if requested
+    if args.reboot:
+        print("\nRebooting controller...")
+        try:
+            response = requests.post(
+                f'http://{args.controller}/api/system/reboot',
+                headers={'Content-Type': 'application/json'},
+                timeout=2
+            )
+            
+            if response.status_code == 200:
+                result = response.json()
+                print(f"✓ {result.get('message', 'Reboot initiated')}")
+                
+                # Wait for reboot
+                print(f"Waiting {args.wait} seconds for reboot...")
+                time.sleep(args.wait)
+                
+                # Try to connect to new IP if changed
+                new_ip = args.ip if args.ip else args.controller
+                print(f"\nAttempting to connect to {new_ip}...")
+                
+                for attempt in range(10):
+                    try:
+                        response = requests.get(f'http://{new_ip}/api/config', timeout=1)
+                        if response.status_code == 200:
+                            print(f"✓ Controller online at {new_ip}")
+                            config = response.json()
+                            print(f"  IP: {config.get('ip_address')}")
+                            print(f"  MAC: {config.get('mac_address')}")
+                            print(f"  Engine: {config.get('current_engine')}")
+                            return 0
+                    except:
+                        pass
+                    
+                    print(f"  Attempt {attempt + 1}/10...", end='\r')
+                    time.sleep(1)
+                
+                print(f"\nWarning: Could not connect to {new_ip} after 10 attempts")
+                print("Controller may still be rebooting or IP may be incorrect")
+                return 1
+                
+            else:
+                print(f"Error: Reboot request failed (HTTP {response.status_code})")
+                print(f"Response: {response.text}")
+                return 1
+                
+        except Exception as e:
+            print(f"Error during reboot: {e}")
+            return 1
+    else:
+        print("\nℹ Config changed but not rebooted. Changes will apply on next boot.")
+        print("  Run with --reboot to apply immediately")
+    
+    return 0
+
+
+if __name__ == '__main__':
+    sys.exit(main())

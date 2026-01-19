@@ -1,5 +1,6 @@
 /**
  * PSRAM Driver for RP2350 (8MB QSPI PSRAM)
+ * Code by NeuroFab Corp: 2025-2026
  * 
  * Hardware Configuration:
  * - CS: GPIO 47 (dedicated PSRAM chip select)
@@ -16,6 +17,7 @@
 
 #include <stdint.h>
 #include <stdbool.h>
+#include <stddef.h>
 
 // PSRAM Hardware Configuration
 #define PSRAM_CS_PIN      47  // GPIO 47 - dedicated PSRAM chip select
@@ -38,5 +40,8 @@ void psram_dma_read(uint32_t addr, void* data, uint32_t len);
 
 // Memory test
 bool psram_test(void);
+
+// Mark PSRAM as initialized (for app partition after bootloader init)
+void psram_mark_initialized(size_t size_bytes);
 
 #endif // PSRAM_RP2350_H

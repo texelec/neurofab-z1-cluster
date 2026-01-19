@@ -1,5 +1,6 @@
 /**
  * Z1 Onyx Cluster - SD Card Stub Implementation
+ * Code by NeuroFab Corp: 2025-2026
  * 
  * Placeholder stub - hardware present but not initialized yet.
  * 
@@ -23,9 +24,6 @@
 #include <stdio.h>
 
 bool sd_card_init(void) {
-    printf("[SD Card] Hardware present (SPI1: MISO=40, CS=41, CLK=42, MOSI=43)\n");
-    printf("[SD Card] Not initialized (stub only)\n");
-    // TODO: Initialize SPI1
-    // TODO: Mount FatFS
-    return true;  // Stub always succeeds
+    printf("[SD-STUB] SD card disabled (compile with USE_SD_CARD to enable)\n");
+    return false;  // Stub always fails init
 }

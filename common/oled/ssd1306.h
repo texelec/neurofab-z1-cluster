@@ -1,5 +1,6 @@
 /**
  * SSD1306 OLED Driver (128x64, I2C)
+ * Code by NeuroFab Corp: 2025-2026
  * 
  * Working driver for I2C OLED display
  * Address: 0x3C (7-bit)

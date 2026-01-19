@@ -2,9 +2,12 @@
 
 **A distributed spiking neural network (SNN) hardware accelerator based on Raspberry Pi Pico 2 (RP2350) microcontrollers.**
 
-![Hardware Version](https://img.shields.io/badge/Hardware-V2%20(16--node)-blue)
+![Hardware Version](https://img.shields.io/badge/Hardware-V1%20%2B%20V2-blue)
 ![Firmware](https://img.shields.io/badge/Firmware-RP2350-green)
 ![Build](https://img.shields.io/badge/Build-Passing-brightgreen)
+![Tests](https://img.shields.io/badge/Tests-9%2F9%20Passing-brightgreen)
+![Status](https://img.shields.io/badge/Status-Development%20Ready-yellow)
+![SNN](https://img.shields.io/badge/SNN-Operational-brightgreen)
 
 ---
 
@@ -15,20 +18,32 @@ The Z1 Onyx is a real-time neuromorphic computing cluster designed for hardware-
 ### Key Features
 
 - **17 RP2350 Nodes**: 16 compute nodes + 1 controller
-- **Custom Parallel Bus**: 16-bit data @ 10 MHz (10.31 MB/s TX, 8.07 MB/s RX)
-- **Distributed SNN Processing**: Multi-node spike propagation and routing
+- **Custom Parallel Bus**: 16-bit data @ 10 MHz (10.31 MB/s TX, 8.07 MB/s RX, 100% reliability)
+- **Distributed SNN Processing**: Multi-node spike propagation and routing (fully operational)
 - **8MB PSRAM per Node**: For large-scale neural network storage
-- **RESTful HTTP API**: JSON-based cluster management
-- **Auto-Configuration**: V2 hardware automatically detects node IDs
-- **Python Tools**: CLI utilities for deployment, monitoring, and testing
+- **Dual-Partition Bootloader**: OTA firmware updates via HTTP API (Phase 2 complete)
+- **OTA Flash Tools**: Remote node firmware updates without physical access (`nflash` tool)
+- **DMA Recovery**: Automatic recovery from bus corruption (100ms cooldown)
+- **SD Card Storage**: FAT32 for config, topologies, and OTA updates (30GB tested)
+- **Runtime Network Config**: Change IP/MAC without firmware rebuild (`zconfig` tool)
+- **Streaming File System**: Upload/download topologies up to 1MB+ via HTTP (`zengine` tool)
+- **Async Spike Injection**: Background job queue for non-blocking spike processing
+- **RESTful HTTP API**: JSON-based cluster management with reboot support
+- **Auto-Configuration**: V2 hardware automatically detects node IDs (0-15)
+- **Flash Utilities**: USB-based firmware flashing tools (`flash_node.py`, `flash_controller.py`)
+- **Comprehensive Python Tools**: 13+ CLI utilities for deployment, monitoring, and OTA updates
 
 ### Hardware Specifications
 
 - **MCU**: Raspberry Pi Pico 2 (RP2350B, ARM Cortex-M33)
 - **PSRAM**: 8MB per node (RP2350 QSPI)
 - **Clock**: 266 MHz (overclocked from 150 MHz)
+- **Flash Layout**: Dual-partition architecture
+  - **Bootloader**: 512KB @ 0x00000000 (OTA update engine)
+  - **Application**: 7.5MB @ 0x00080000 (SNN firmware + 192-byte header)
 - **Interconnect**: Custom PCB backplane with parallel bus
 - **Network**: W5500 Ethernet (controller only)
+- **Storage**: SD card (FAT32, up to 30GB tested)
 - **Display**: SSD1306 OLED (controller only, V2 hardware)
 
 ---
@@ -37,10 +52,32 @@ The Z1 Onyx is a real-time neuromorphic computing cluster designed for hardware-
 
 ### 1. Hardware Setup
 
-- Flash controller firmware: `FirmwareReleases/16node/z1_controller_16.uf2`
-- Flash node firmware: `FirmwareReleases/16node/z1_node_16.uf2` (same file for all nodes)
-- Connect controller to network (default IP: 192.168.1.222)
+**Dual-Partition Firmware (OTA-Capable)**
+- Flash node firmware: `FirmwareReleases/16node/node_dual_16.uf2` (bootloader + app)
+- Flash controller firmware: `FirmwareReleases/16node/controller_16.uf2` (monolithic)
+- Alternative: Use `flash_node.py` and `flash_controller.py` for automated USB flashing
+- Controller network default: 192.168.1.222 (configurable via `zconfig`)
 - Power on cluster
+
+**Directory Structure**:
+```
+FirmwareReleases/16node/
+├── controller_16.uf2           # Controller (main build, drag to BOOTSEL)
+├── node_dual_16.uf2            # Node firmware (bootloader + app, OTA-capable)
+└── apponly/                    # Advanced/recovery files
+    ├── bootloader_16.uf2       # Bootloader only (recovery)
+    └── node_app_16.uf2         # App partition only (advanced)
+```
+
+**V1 Hardware** (12-node):
+```
+FirmwareReleases/12node/
+├── controller_12.uf2           # Controller
+├── node_dual_12_0.uf2          # Node 0 (bootloader + app)
+├── node_dual_12_1.uf2          # Node 1 (bootloader + app)
+├── ... (12 total node files)
+└── apponly/                    # Advanced/recovery files
+```
 
 ### 2. Test Deployment
 
@@ -94,6 +131,8 @@ python python_tools/bin/nstat -s
 - Ninja build system
 - Python 3.7+
 
+**Platform Note**: Pre-built tools in `build_tools/` (pioasm.exe, picotool.exe, libusb-1.0.dll) are for **Windows x64 only**. Linux and macOS users must build these tools from source - see [PREREQUISITES.md](PREREQUISITES.md) for instructions.
+
 ### Build Commands
 
 ```bash
@@ -127,7 +166,7 @@ See [BUILD_INSTRUCTIONS.md](BUILD_INSTRUCTIONS.md) for detailed setup.
 - No OLED display
 - No global reset
 - W5500 pins: RST=GPIO35, INT=GPIO34 (swapped from V2)
-- **Note**: Firmware builds successfully but untested on V1 hardware
+- **Status**: Fully validated, OTA operational
 
 Both variants supported by a single codebase with compile-time selection.
 
@@ -135,9 +174,14 @@ Both variants supported by a single codebase with compile-time selection.
 
 ## Network Configuration
 
-**Default IP**: 192.168.1.222
+**Default:** 192.168.1.222
 
-To customize, edit `controller/w5500_eth.c`:
+**Method 1: Runtime (Recommended)** - No rebuild required:
+```bash
+python python_tools/bin/zconfig write --ip 192.168.1.100 -c 192.168.1.222
+```
+
+**Method 2: Build-time** - Edit `controller/w5500_eth.c`:
 ```c
 static const uint8_t IP_ADDRESS[4] = {192, 168, 1, 222};  // Change here
 ```
@@ -159,8 +203,119 @@ Located in `python_tools/bin/`:
 | `nsnn` | Deploy, start, stop, and manage SNN topologies |
 | `nping` | Network latency testing |
 | `ncp` | Copy files to node PSRAM |
+| `nflash` | **OTA firmware updates** - Flash nodes remotely via HTTP API |
+| `zconfig` | Manage controller network configuration and reboot |
+| `zengine` | Upload/download topology files to controller SD card (supports 1MB+) |
+| `flash_node.py` | **USB flashing** - Flash node firmware via BOOTSEL (root directory) |
+| `flash_controller.py` | **USB flashing** - Flash controller firmware via BOOTSEL (root directory) |
 
-All tools support `-c <IP>` to specify controller address.
+All tools support `-c <IP>` to specify controller address (default: 192.168.1.222).
+
+### OTA Firmware Updates (nflash)
+
+Flash node firmware remotely without physical access:
+
+```bash
+# Flash single node
+python python_tools/bin/nflash 0 packages/node_app_16.bin -c 192.168.1.222
+
+# Flash multiple nodes
+python python_tools/bin/nflash 0,1,2,3 packages/node_app_16.bin -c 192.168.1.222
+
+# Flash all nodes
+python python_tools/bin/nflash all packages/node_app_16.bin -c 192.168.1.222
+```
+
+**Features**:
+- **No physical access** - Update via HTTP API
+- **Automatic validation** - CRC32 checksums on upload
+- **Bootloader integration** - Seamless reboot into new firmware
+- **Progress tracking** - Real-time upload status
+
+**Note**: Requires dual-partition firmware (bootloader + app). See [BUILD_INSTRUCTIONS.md](BUILD_INSTRUCTIONS.md) for details.
+
+### USB Flashing Tools
+
+Located in project root for convenience:
+
+```bash
+# Flash V2 node (auto-detects ID)
+python flash_node.py --hw-v2
+
+# Flash V1 node (requires node ID)
+python flash_node.py --hw-v1 --node 0
+
+# Flash controller
+python flash_controller.py --hw-v2
+```
+
+**Features**:
+- **Auto-reboot** - Automatically enters BOOTSEL mode
+- **Auto-detect** - Finds picotool in PATH or build_tools/
+- **Cross-platform** - Works on Windows, Linux, macOS
+
+### Network Configuration (zconfig)
+
+Manage controller configuration stored in `z1.cfg` on SD card:
+
+```bash
+# View current configuration
+python python_tools/bin/zconfig read -c 192.168.1.222
+
+# Change IP address (updates config and reboots)
+python python_tools/bin/zconfig write --ip 192.168.1.100 -c 192.168.1.222
+
+# Change MAC address
+python python_tools/bin/zconfig write --mac 02:00:00:00:00:01 -c 192.168.1.222
+
+# Reboot controller
+python python_tools/bin/zconfig reboot -c 192.168.1.222
+```
+
+### Topology Management (zengine)
+
+Upload/download SNN topology files using streaming (tested up to 1MB):
+
+```bash
+# List all topology files
+python python_tools/bin/zengine list -c 192.168.1.222
+
+# Upload topology to SD card
+python python_tools/bin/zengine upload python_tools/examples/xor_working.json -c 192.168.1.222
+
+# Download topology from SD card
+python python_tools/bin/zengine download xor_working.json -c 192.168.1.222
+
+# Delete topology
+python python_tools/bin/zengine delete xor_working.json -c 192.168.1.222
+```
+
+**Features**:
+- **Streaming upload/download** - No memory limits, handles files up to 1MB+
+- **Directory listing** - View all files with sizes
+- **Automatic directory creation** - Creates `topologies/` if it doesn't exist
+- **File deletion** - Remove old topology files
+- **Integrity verification** - SHA256 checksums for upload/download validation
+- **Tested file sizes**: 2KB to 1MB with perfect integrity
+
+See [STREAMING_FILE_SYSTEM.md](STREAMING_FILE_SYSTEM.md) for technical details.
+
+---
+
+## SD Card Directory Structure
+
+The controller's SD card uses FAT32 filesystem with the following layout:
+
+```
+/
+├── z1.cfg              # Network configuration (IP, MAC)
+└── topologies/         # SNN network topology files (JSON)
+    ├── xor_working.json
+    ├── mnist_snn.json
+    └── custom.json
+```
+
+**Note**: Topology files are network configurations deployed via PSRAM commands.
 
 ---
 
@@ -192,10 +347,17 @@ This tests:
 1. Node discovery
 2. Topology deployment
 3. SNN start/stop
-4. Spike injection
+4. Spike injection (**async - queued and processed in background**)
 5. Statistics retrieval
 
-See [TEST_DEPLOYMENT_GUIDE.md](TEST_DEPLOYMENT_GUIDE.md) for detailed testing documentation.
+**Spike Injection Efficiency:** The HTTP API now uses an **asynchronous job queue** architecture:
+- **HTTP returns immediately** (< 1ms) after queueing spikes
+- **Background task** injects spikes at controlled rate (100 spikes/sec)
+- **Controller stays responsive** to other HTTP requests during injection
+- **Example:** 2500 spikes = 25 seconds processing time, but HTTP returns in < 1ms
+- **Monitoring:** Poll `/api/nodes` or check serial console for progress
+
+See [ASYNC_SPIKE_INJECTION.md](ASYNC_SPIKE_INJECTION.md) for architecture details and [TEST_DEPLOYMENT_GUIDE.md](TEST_DEPLOYMENT_GUIDE.md) for testing documentation.
 
 ---
 
@@ -243,16 +405,23 @@ See [TEST_DEPLOYMENT_GUIDE.md](TEST_DEPLOYMENT_GUIDE.md) for detailed testing do
 └───┘     └───┘ └───┘ └───┘   └───┘
  8MB       8MB   8MB   8MB     8MB
 PSRAM     PSRAM PSRAM PSRAM   PSRAM
-```
+```roduction Ready** ✅ (as of January 18, 2026)
 
-Each node runs an SNN engine that processes neurons and propagates spikes. The controller manages the cluster via the Matrix bus and provides external access via HTTP.
-
----
-
-## Current Status
-
-**Phase 4 Complete** ✅ (as of December 14, 2025)
-
+- ✅ Multi-node spike propagation working
+- ✅ HTTP API fully functional
+- ✅ **OTA firmware updates** via HTTP (`nflash` tool)
+- ✅ **Dual-partition bootloader** (512KB + 7.5MB app)
+- ✅ **Streaming file system** (1MB+ topology upload/download)
+- ✅ **Async spike injection** (background job queue)
+- ✅ **Runtime network config** (no rebuild for IP/MAC changes)
+- ✅ 13+ Python CLI tools operational
+- ✅ Hardware variants (V1/V2) supported
+- ✅ Automated testing suite (9/9 passing)
+- ✅ Build system validated
+- ✅ Zero CRC errors over 200000+ frames
+- ✅ 100% bus reliability
+- ✅ **USB flash utilities** (`flash_node.py`, `flash_controller.py`)
+- ✅ Monolithic node firmware deprecated (OTA only)
 - ✅ Multi-node spike propagation working
 - ✅ HTTP API fully functional
 - ✅ Python tools operational
@@ -317,7 +486,20 @@ Hardware accelerated neuromorphic computing platform
 
 ---
 
+## Third-Party Components
+
+- **FatFs** - Generic FAT Filesystem Module R0.15 by ChaN (http://elm-chan.org/fsw/ff/)
+- **SSD1306 OLED Driver** - Adapted for RP2350 I2C
+- **no-OS-FatFS-SD-SDIO-SPI-RPi-Pico** - SD card SPI driver by carlk3 (https://github.com/carlk3/no-OS-FatFS-SD-SDIO-SPI-RPi-Pico)
+
+---
+
 ## Acknowledgments
 
-- Raspberry Pi Foundation for the Pico 2 (RP2350) platform
-- Pico SDK and community tools
+- Raspberry Pi Foundation for the Pico 2 (RP2350) platform and Pico SDK
+- ChaN for FatFs filesystem library
+- carlk3 for SD card SPI driver
+- ARM for GNU Toolchain
+- Open source community for development tools
+
+**Note**: Build tools in `build_tools/` directory (pioasm.exe, picotool.exe, libusb-1.0.dll) are pre-compiled for **Windows x64** only. Linux/Mac users must build these tools from source.

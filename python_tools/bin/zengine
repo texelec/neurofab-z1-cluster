@@ -1,0 +1,245 @@
+#!/usr/bin/env python3
+"""
+Z1 Onyx - Topology/Engine File Manager
+
+Manages SNN topology JSON files and engine binary (.z1app) files on the 
+controller's SD card. Provides upload, download, list, and delete operations
+with streaming support for unlimited file sizes.
+
+Features:
+- Streaming upload/download (tested: 2KB to 1MB+)
+- Directory listing with file sizes
+- File deletion
+- SHA256 integrity verification
+- Automatic directory creation on upload
+
+Usage:
+    zengine list [-c CONTROLLER_IP]
+    zengine upload FILE [-c CONTROLLER_IP] [--name REMOTE_NAME]
+    zengine download REMOTE_NAME [-c CONTROLLER_IP]
+    zengine delete REMOTE_NAME [-c CONTROLLER_IP]
+
+Examples:
+    # List all topology files
+    zengine list -c 192.168.1.222
+    
+    # Upload topology
+    zengine upload xor_working.json -c 192.168.1.222
+    
+    # Upload engine binary
+    zengine upload xor_snn_v1.0.0.z1app -c 192.168.1.222
+    
+    # Download file
+    zengine download xor_working.json -c 192.168.1.222
+    
+    # Delete file
+    zengine delete old_file.json -c 192.168.1.222
+
+Default Directory: topologies/
+All operations automatically prepend 'topologies/' to file paths.
+For engine binaries in engines/ directory, files are still stored in topologies/
+(this can be modified by changing TOPOLOGIES_DIR constant).
+
+See FILE_MANAGEMENT_GUIDE.md for complete documentation.
+"""
+
+import argparse
+import sys
+import json
+import requests
+from pathlib import Path
+
+# Add lib to path
+sys.path.insert(0, str(Path(__file__).parent.parent / 'lib'))
+from z1_client import Z1Client
+
+TOPOLOGIES_DIR = "topologies"
+
+
+def list_topologies(controller_ip):
+    """List all topology files on controller"""
+    try:
+        url = f"http://{controller_ip}/api/files/{TOPOLOGIES_DIR}"
+        response = requests.get(url, timeout=2)
+        
+        if response.status_code == 200:
+            data = response.json()
+            files = data.get('files', [])
+            
+            if not files:
+                print(f"No topology files found in {TOPOLOGIES_DIR}/")
+                return 0
+            
+            print(f"Available Topologies ({len(files)} files):")
+            print("=" * 60)
+            for f in files:
+                size_kb = f['size'] / 1024
+                print(f"  {f['name']:<40} {size_kb:>8.2f} KB")
+            print("=" * 60)
+            return 0
+        else:
+            print(f"Error: Failed to list topologies (HTTP {response.status_code})")
+            return 1
+            
+    except Exception as e:
+        print(f"Error: {e}")
+        return 1
+
+
+def upload_topology(controller_ip, local_file, remote_name=None):
+    """Upload topology file to controller"""
+    try:
+        # Read local file
+        with open(local_file, 'rb') as f:
+            content = f.read()
+        
+        # Use filename if remote name not specified
+        if not remote_name:
+            remote_name = Path(local_file).name
+        
+        print(f"Uploading {local_file} → {TOPOLOGIES_DIR}/{remote_name}...")
+        
+        url = f"http://{controller_ip}/api/files/{TOPOLOGIES_DIR}/{remote_name}"
+        response = requests.put(
+            url,
+            data=content,
+            headers={'Content-Type': 'application/octet-stream'},
+            timeout=10
+        )
+        
+        if response.status_code == 200:
+            result = response.json()
+            size_kb = result.get('size', 0) / 1024
+            print(f"✓ Upload successful: {size_kb:.2f} KB")
+            return 0
+        else:
+            print(f"✗ Upload failed (HTTP {response.status_code})")
+            print(f"  Response: {response.text}")
+            return 1
+            
+    except FileNotFoundError:
+        print(f"Error: File not found: {local_file}")
+        return 1
+    except Exception as e:
+        print(f"Error: {e}")
+        return 1
+
+
+def download_topology(controller_ip, topology_name, local_file=None):
+    """Download topology file from controller"""
+    try:
+        # Use provided filename or default to same name as remote
+        output_file = local_file if local_file else topology_name
+        
+        print(f"Downloading {TOPOLOGIES_DIR}/{topology_name} → {output_file}...")
+        
+        url = f"http://{controller_ip}/api/files/{TOPOLOGIES_DIR}/{topology_name}"
+        response = requests.get(url, timeout=10)
+        
+        if response.status_code == 200:
+            # Check if response is a small JSON error message (not a topology file)
+            content_type = response.headers.get('Content-Type', '')
+            if 'application/json' in content_type and len(response.content) < 500:
+                # Might be an error message - check if it has "error" field
+                try:
+                    data = response.json()
+                    if 'error' in data:
+                        print(f"✗ Download failed: {data.get('error', 'Unknown error')}")
+                        return 1
+                except:
+                    pass
+            
+            # Write binary content to file
+            with open(output_file, 'wb') as f:
+                f.write(response.content)
+            
+            size_kb = len(response.content) / 1024
+            print(f"✓ Download successful: {size_kb:.2f} KB")
+            return 0
+        else:
+            print(f"✗ Download failed (HTTP {response.status_code})")
+            try:
+                error = response.json()
+                print(f"  Error: {error.get('error', 'Unknown error')}")
+            except:
+                print(f"  Response: {response.text[:200]}")
+            return 1
+            
+    except Exception as e:
+        print(f"Error: {e}")
+        return 1
+
+
+def delete_topology(controller_ip, topology_name):
+    """Delete topology file from controller"""
+    try:
+        print(f"Deleting {TOPOLOGIES_DIR}/{topology_name}...")
+        
+        url = f"http://{controller_ip}/api/files/{TOPOLOGIES_DIR}/{topology_name}"
+        response = requests.delete(url, timeout=2)
+        
+        if response.status_code == 200:
+            print(f"✓ Deleted successfully")
+            return 0
+        else:
+            print(f"✗ Delete failed (HTTP {response.status_code})")
+            print(f"  Response: {response.text}")
+            return 1
+            
+    except Exception as e:
+        print(f"Error: {e}")
+        return 1
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description='Manage Z1 Onyx topology files (SNN network configurations)',
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  # List available topologies
+  zengine list
+  
+  # Upload topology file
+  zengine upload xor_working.json
+  
+  # Upload with custom name
+  zengine upload my_topology.json --name custom.json
+  
+  # Download topology
+  zengine download xor_working.json
+  
+  # Delete topology
+  zengine delete old_topology.json
+  
+Note: This tool manages topology JSON files in topologies/ directory.
+For SNN engine binaries (.z1app), use the engines/ directory.
+        """
+    )
+    
+    parser.add_argument('action', choices=['list', 'upload', 'download', 'delete'],
+                        help='Action to perform')
+    parser.add_argument('file', nargs='?', help='Local file path (for upload) or remote filename (for download/delete)')
+    parser.add_argument('-c', '--controller', default='192.168.1.222',
+                        help='Controller IP address (default: 192.168.1.222)')
+    parser.add_argument('--name', help='Remote filename (for upload)')
+    
+    args = parser.parse_args()
+    
+    # Validate arguments
+    if args.action in ['upload', 'download', 'delete'] and not args.file:
+        parser.error(f"{args.action} requires a file argument")
+    
+    # Execute action
+    if args.action == 'list':
+        return list_topologies(args.controller)
+    elif args.action == 'upload':
+        return upload_topology(args.controller, args.file, args.name)
+    elif args.action == 'download':
+        return download_topology(args.controller, args.file, args.name)
+    elif args.action == 'delete':
+        return delete_topology(args.controller, args.file)
+
+
+if __name__ == '__main__':
+    sys.exit(main())

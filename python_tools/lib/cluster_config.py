@@ -193,7 +193,7 @@ class ClusterConfig:
         1. Environment variable Z1_CONTROLLER_IP
         2. First backplane in config
         3. Auto-detect emulator at localhost:8000
-        4. Default to real hardware at 192.168.1.222:80
+        4. Default to real hardware at 192.168.1.201:80
         """
         # Check environment variable
         controller_ip = os.environ.get('Z1_CONTROLLER_IP')
@@ -237,7 +237,7 @@ class ClusterConfig:
         # Default to real hardware
         return BackplaneConfig(
             name='default',
-            controller_ip='192.168.1.222',
+            controller_ip='192.168.1.201',
             controller_port=80,
             node_count=16,
             description='Default hardware'
@@ -264,7 +264,7 @@ def create_default_config(output_file: str):
     # Add example backplanes
     config.add_backplane(BackplaneConfig(
         name="backplane-0",
-        controller_ip="192.168.1.222",
+        controller_ip="192.168.1.201",
         controller_port=80,
         node_count=16,
         description="Primary backplane"

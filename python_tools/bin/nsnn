@@ -112,7 +112,7 @@ def deploy_snn(args):
         # Deploy to each node on this backplane
         for node_id in node_list:
             table_data = deployment_plan.neuron_tables[(bp_name, node_id)]
-            neuron_count = len(table_data) // 256
+            neuron_count = deployment_plan.neuron_counts[(bp_name, node_id)]  # Use stored count (excludes end marker)
             
             try:
                 # Write neuron table to node memory
@@ -365,6 +365,9 @@ def inject_spikes(args):
     deployment_plan = info['deployment_plan']
     neuron_map = {int(k): v for k, v in deployment_plan['neuron_map'].items()}
     
+    print(f"[DEBUG] Neuron map has {len(neuron_map)} neurons: {list(neuron_map.keys())}")
+    print(f"[DEBUG] Spike pattern neurons: {[s['neuron_id'] for s in spikes]}")
+    
     # Group spikes by backplane
     spikes_by_backplane = {}
     for spike in spikes:
@@ -374,6 +377,10 @@ def inject_spikes(args):
             if bp_name not in spikes_by_backplane:
                 spikes_by_backplane[bp_name] = []
             spikes_by_backplane[bp_name].append(spike)
+        else:
+            print(f"[DEBUG] Neuron {neuron_id} NOT in neuron_map!")
+    
+    print(f"[DEBUG] Spikes grouped: {len(spikes_by_backplane)} backplanes")
     
     # Inject spikes to each backplane
     config = ClusterConfig(args.config)

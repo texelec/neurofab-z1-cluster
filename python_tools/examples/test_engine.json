@@ -1,0 +1,7 @@
+{
+  "name": "Test Engine",
+  "version": "1.0",
+  "type": "iaf",
+  "neurons": 100,
+  "description": "Test engine file for upload testing"
+}

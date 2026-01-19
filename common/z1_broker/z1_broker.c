@@ -1,5 +1,6 @@
 /**
  * Z1 Onyx Bus - Broker Layer Implementation
+ * Code by NeuroFab Corp: 2025-2026
  * 
  * Collision-aware multi-master arbitration for SNN spike traffic
  */
@@ -57,6 +58,12 @@ static bool z1_broker_try_send(z1_broker_request_t *req, bool is_spike);
 // Queue Management (Dual-Queue Architecture)
 // ============================================================================
 
+// ============================================================================
+// Spike Queue Functions (Application mode only)
+// ============================================================================
+
+#if Z1_BROKER_SPIKE_QUEUE_DEPTH > 0
+
 // Spike queue helpers
 static inline bool spike_queue_is_full(void) {
     return broker_queue.spike_count >= Z1_BROKER_SPIKE_QUEUE_DEPTH;
@@ -69,7 +76,17 @@ static inline bool spike_queue_is_empty(void) {
 static bool spike_queue_enqueue(z1_broker_request_t *req) {
     if (spike_queue_is_full()) return false;
     
-    memcpy(&broker_queue.spike_queue[broker_queue.spike_tail], req, sizeof(z1_broker_request_t));
+    // OPTIMIZED: Only copy the used payload, not the entire 1200-byte buffer!
+    z1_broker_request_t *dest = &broker_queue.spike_queue[broker_queue.spike_tail];
+    memcpy(dest->payload, req->payload, req->num_words * sizeof(uint16_t));  // Copy ONLY used data
+    dest->num_words = req->num_words;
+    dest->dest = req->dest;
+    dest->flags = req->flags;
+    dest->stream = req->stream;
+    dest->is_broadcast = req->is_broadcast;
+    dest->retry_count = req->retry_count;
+    dest->queued_time_us = req->queued_time_us;
+    
     broker_queue.spike_tail = (broker_queue.spike_tail + 1) % Z1_BROKER_SPIKE_QUEUE_DEPTH;
     broker_queue.spike_count++;
     
@@ -89,6 +106,8 @@ static void spike_queue_dequeue(void) {
     broker_queue.spike_head = (broker_queue.spike_head + 1) % Z1_BROKER_SPIKE_QUEUE_DEPTH;
     broker_queue.spike_count--;
 }
+
+#endif  // Z1_BROKER_SPIKE_QUEUE_DEPTH > 0
 
 // Command queue helpers
 static inline bool cmd_queue_is_full(void) {
@@ -147,24 +166,33 @@ static inline uint32_t z1_broker_calculate_backoff(uint8_t node_id) {
 // ============================================================================
 
 void z1_broker_init(void) {
+    printf("[BROKER] Starting broker_init...\n");
+    
     // Initialize queue
     memset(&broker_queue, 0, sizeof(broker_queue));
+    printf("[BROKER] Queue initialized\n");
     
     // Initialize stats
     memset(&broker_stats, 0, sizeof(broker_stats));
     broker_stats.min_latency_us = UINT32_MAX;
+    printf("[BROKER] Stats initialized\n");
     
     // Get local node ID from bus layer
     local_node_id = z1_bus_get_node_id();
+    printf("[BROKER] Got node ID: %d\n", local_node_id);
+    printf("[BROKER] Broker init complete\n");
 }
 
 bool z1_broker_send_spike(const uint16_t *data, uint8_t num_words, uint8_t dest, uint8_t stream) {
+#if Z1_BROKER_SPIKE_QUEUE_DEPTH > 0
     if (num_words == 0 || num_words > Z1_BROKER_MAX_PAYLOAD_WORDS) {
+        printf("[BROKER] send_spike FAILED: invalid num_words=%d\n", num_words);
         return false;
     }
     
     if (spike_queue_is_full()) {
         broker_stats.total_dropped++;
+        // Silently fail - backpressure handled by caller retry
         return false;
     }
     
@@ -178,7 +206,13 @@ bool z1_broker_send_spike(const uint16_t *data, uint8_t num_words, uint8_t dest,
     req.retry_count = 0;
     req.queued_time_us = time_us_64();
     
+    // printf("[BROKER] Spike queued: dest=%d, broadcast=%d, words=%d\n", dest, req.is_broadcast, num_words);
+    
     return spike_queue_enqueue(&req);
+#else
+    // Bootloader mode: spike sending disabled
+    return false;
+#endif
 }
 
 bool z1_broker_send_command(const uint16_t *data, uint16_t num_words, uint8_t dest, uint8_t stream) {
@@ -218,7 +252,8 @@ bool z1_broker_send(const uint16_t *data, uint8_t num_words,
         return z1_broker_send_spike(data, num_words, dest, stream);
     } else {
         // ACK → command queue (Type 1)
-        return z1_broker_send_command(data, num_words, dest, stream);
+        // CRITICAL: Cast num_words to uint16_t to match function signature
+        return z1_broker_send_command(data, (uint16_t)num_words, dest, stream);
     }
 }
 
@@ -242,17 +277,51 @@ uint16_t z1_broker_receive(uint16_t *rx_buffer, uint8_t *src, uint8_t *stream) {
 }
 
 void z1_broker_task(void) {
-    // Priority scheduler: Always service spike queue before command queue
+    // Priority scheduler: Always service COMMAND queue before SPIKE queue
+    // Commands (GET_SNN_STATUS, etc.) need prompt response, spikes can tolerate delay
     
     static uint32_t debug_count = 0;
     static bool first_command_logged = false;
     
-    // Check if still in backoff period (applies to BOTH queues)
+    // Check COMMAND queue first (HIGH PRIORITY - ignores backoff)
+    if (!cmd_queue_is_empty()) {
+        // Peek at next command
+        z1_broker_request_t *req = cmd_queue_peek();
+        if (req == NULL) {
+            return;
+        }
+        
+        if (!first_command_logged) {
+#if Z1_BROKER_SPIKE_QUEUE_DEPTH > 0
+            printf("[BROKER-TASK] CMD pending: dest=%d stream=%d (spike_queue=%d)\n", 
+                   req->dest, req->stream, broker_queue.spike_count);
+#else
+            printf("[BROKER-TASK] CMD pending: dest=%d stream=%d (bootloader mode)\n", 
+                   req->dest, req->stream);
+#endif
+            first_command_logged = true;
+        }
+        
+        // Commands don't go stale (reliable delivery required)
+        
+        // Try to send command (commands ignore backoff period)
+        if (z1_broker_try_send(req, false)) {  // false = command queue
+            cmd_queue_dequeue();
+            first_command_logged = false;  // Reset for next command
+        }
+        // CRITICAL: Return even if send failed to give command another chance next iteration
+        // This prevents spike queue from being serviced while commands are pending
+        return;
+    }
+    
+#if Z1_BROKER_SPIKE_QUEUE_DEPTH > 0
+    // Check if still in backoff period (applies to SPIKE queue only)
     if (!time_reached(backoff_until)) {
         return;  // Still backing off from previous burst
     }
     
-    // Check spike queue first (high priority)
+    // Check SPIKE queue second (LOW PRIORITY)
+    // Only process spikes when NO commands are waiting
     if (!spike_queue_is_empty()) {
         // Peek at next spike
         z1_broker_request_t *req = spike_queue_peek();
@@ -262,41 +331,38 @@ void z1_broker_task(void) {
         uint64_t now_us = time_us_64();
         uint64_t age_us = now_us - req->queued_time_us;
         if (age_us > Z1_BROKER_STALE_TIMEOUT_US) {
+            printf("[BROKER] Dropping stale spike (age=%llu us)\n", age_us);
             spike_queue_dequeue();
             broker_stats.total_dropped++;
             return;
         }
         
         // Try to send spike (returns immediately if bus busy)
-        if (z1_broker_try_send(req, true)) {  // true = spike queue
+        bool tx_result = z1_broker_try_send(req, true);  // true = spike queue
+        if (tx_result) {
             spike_queue_dequeue();
-        }
-        return;  // Exit - one frame per task() call
-    }
-    
-    // Check command queue second (low priority)
-    if (!cmd_queue_is_empty()) {
-        printf("[BROKER DEBUG] Command queue not empty! Attempting send...\n");
-        
-        // Peek at next command
-        z1_broker_request_t *req = cmd_queue_peek();
-        if (req == NULL) {
-            printf("[BROKER DEBUG] cmd_queue_peek() returned NULL!\n");
-            return;
-        }
-        
-        // Commands don't go stale (reliable delivery required)
-        
-        // Try to send command
-        printf("[BROKER DEBUG] Calling z1_broker_try_send() for command...\n");
-        if (z1_broker_try_send(req, false)) {  // false = command queue
-            printf("[BROKER DEBUG] z1_broker_try_send() SUCCESS! Dequeuing command.\n");
-            cmd_queue_dequeue();
+            req->retry_count = 0;  // Reset on success
         } else {
-            printf("[BROKER DEBUG] z1_broker_try_send() FAILED (bus busy or lost arbitration)\n");
+            // TX failed - increment retry count
+            req->retry_count++;
+            
+            // After 3 quick retries, assume DMA hardware failure and flush queue
+            if (req->retry_count > 3) {
+                printf("[BROKER] CRITICAL: DMA hardware failure detected after 3 retries\n");
+                printf("[BROKER] Flushing entire spike queue (%d spikes dropped)\n", broker_queue.spike_count);
+                
+                // Drop all pending spikes - they will all fail anyway
+                while (!spike_queue_is_empty()) {
+                    spike_queue_dequeue();
+                    broker_stats.total_dropped++;
+                }
+                
+                return;  // Exit immediately
+            }
         }
         return;  // Exit - one frame per task() call
     }
+#endif  // Z1_BROKER_SPIKE_QUEUE_DEPTH > 0
     
     // Both queues empty - reset burst counter
     burst_frame_count = 0;
@@ -304,23 +370,28 @@ void z1_broker_task(void) {
 
 // Helper function to attempt sending a request
 static bool z1_broker_try_send(z1_broker_request_t *req, bool is_spike) {
-    printf("[BROKER DEBUG] z1_broker_try_send() called (is_spike=%d)\n", is_spike);
+    // Adaptive timeout: Commands get progressively longer waits on retries
+    // This ensures commands eventually get through without blocking main loop on first attempt
+    uint32_t bus_wait_timeout_us;
+    if (is_spike) {
+        bus_wait_timeout_us = 50;  // Spikes: Fast fail if bus busy
+    } else {
+        // Commands: Progressive backoff (50µs → 100µs → 200µs → 500µs → 1ms max)
+        bus_wait_timeout_us = 50 + (req->retry_count * 50);
+        if (bus_wait_timeout_us > 1000) bus_wait_timeout_us = 1000;
+    }
     
-    // Wait for bus idle (with timeout)
+    // Wait for bus idle
     uint32_t wait_start_us = time_us_32();
-    uint32_t loop_count = 0;
     while (z1_broker_carrier_sense()) {
-        loop_count++;
         uint32_t elapsed = time_us_32() - wait_start_us;
-        if (elapsed >= Z1_BROKER_CARRIER_SENSE_TIMEOUT_US) {
-            // Bus stuck busy, exit to allow RX processing
-            printf("[BROKER DEBUG] Carrier sense timeout after %lu loops!\n", loop_count);
+        if (elapsed >= bus_wait_timeout_us) {
+            // Bus busy, return false to try again next iteration
             broker_stats.carrier_sense_busy_count++;
-            return false;  // Try again next iteration
+            return false;
         }
         tight_loop_contents();
     }
-    printf("[BROKER DEBUG] Bus idle after %lu loops, proceeding to transmit...\n", loop_count);
     broker_stats.carrier_sense_idle_count++;
     
     // Calculate backoff with priority-based arbitration
@@ -336,38 +407,28 @@ static bool z1_broker_try_send(z1_broker_request_t *req, bool is_spike) {
     bool tx_success = false;
     
     if (is_spike) {
+        // printf("[BROKER-TX] Sending SPIKE frame\n");
         // Spike: UNICAST or BROADCAST, always with NO_ACK
         if (req->is_broadcast) {
             // Broadcast spike to all nodes
-            printf("[BROKER DEBUG] About to send BROADCAST spike: dest=31, stream=%d, words=%lu\n", 
-                   req->stream, req->num_words);
-            tx_success = z1_bus_send_frame(Z1_FRAME_TYPE_BROADCAST, 31, 
+            printf("[BROKER-TX] -> BROADCAST spike to all nodes\n");
+            tx_success = z1_bus_send_frame(Z1_FRAME_TYPE_BROADCAST, 31,
                                            req->stream | Z1_STREAM_NO_ACK,
                                            req->payload, req->num_words);
         } else {
             // Unicast spike to specific node
-            printf("[BROKER DEBUG] About to send UNICAST spike: dest=%d, stream=%d, words=%lu\n", 
-                   req->dest, req->stream, req->num_words);
+            // printf("[BROKER-TX] -> UNICAST spike to node %d\n", req->dest);
             tx_success = z1_bus_send_frame(Z1_FRAME_TYPE_UNICAST, req->dest,
                                            req->stream | Z1_STREAM_NO_ACK,
                                            req->payload, req->num_words);
         }
-        printf("[BROKER DEBUG] Spike send completed, success=%d\n", tx_success);
+        // printf("[BROKER-TX] Spike TX result: %s\n", tx_success ? "SUCCESS" : "FAILED");
     } else {
         // Command: CTRL frame (application handles response)
-        printf("[BROKER DEBUG] About to send CTRL: dest=%d, stream=%d, words=%lu\n", 
-               req->dest, req->stream, req->num_words);
         tx_success = z1_bus_send_frame(Z1_FRAME_TYPE_CTRL, req->dest,
                                        req->stream,  // No NO_ACK flag
                                        req->payload, req->num_words);
-        printf("[BROKER DEBUG] Bus send completed, success=%d\n", tx_success);
-    }
-    
-    // Increment burst counter
-    burst_frame_count++;
-    
-    // Check if burst limit reached - enforce backoff to allow other nodes
-    if (burst_frame_count >= Z1_BROKER_MAX_BURST) {
+        printf("[BROKER-TX] CMD->%d stream=%d %s\n", req->dest, req->stream, tx_success ? "OK" : "FAIL");
         backoff_until = make_timeout_time_us(Z1_BROKER_BACKOFF_US);
         burst_frame_count = 0;
     }
@@ -392,12 +453,28 @@ static bool z1_broker_try_send(z1_broker_request_t *req, bool is_spike) {
         // (Safe because req is a pointer to queue entry, and we're the only writer)
         req->retry_count++;
         if (req->retry_count >= Z1_BROKER_MAX_RETRIES) {
+            printf("[BROKER-TX] DROP %d\n", req->dest);
             broker_stats.total_dropped++;
             return true;  // Max retries - drop and dequeue
         }
+        printf("[BROKER-TX] RETRY %d #%d\n", req->dest, req->retry_count);
         broker_stats.total_collisions++;  // Track retry as collision
         return false;  // Keep in queue for retry
     }
+}
+
+void z1_broker_flush_spike_queue(void) {
+#if Z1_BROKER_SPIKE_QUEUE_DEPTH > 0
+    uint32_t dropped = broker_queue.spike_count;
+    if (dropped > 0) {
+        printf("[BROKER] Flushing %lu pending spikes\n", dropped);
+        broker_stats.total_dropped += dropped;
+    }
+    
+    broker_queue.spike_head = 0;
+    broker_queue.spike_tail = 0;
+    broker_queue.spike_count = 0;
+#endif
 }
 
 void z1_broker_get_stats(z1_broker_stats_t *stats) {
@@ -407,23 +484,38 @@ void z1_broker_get_stats(z1_broker_stats_t *stats) {
     memcpy(stats, &broker_stats, sizeof(z1_broker_stats_t));
     
     // Add current queue depths (dual-queue)
+#if Z1_BROKER_SPIKE_QUEUE_DEPTH > 0
     stats->current_queue_depth = broker_queue.spike_count + broker_queue.cmd_count;
     stats->peak_queue_depth = broker_queue.spike_peak + broker_queue.cmd_peak;
+#else
+    stats->current_queue_depth = broker_queue.cmd_count;
+    stats->peak_queue_depth = broker_queue.cmd_peak;
+#endif
 }
 
 void z1_broker_reset_stats(void) {
     memset(&broker_stats, 0, sizeof(broker_stats));
     broker_stats.min_latency_us = UINT32_MAX;
+#if Z1_BROKER_SPIKE_QUEUE_DEPTH > 0
     broker_queue.spike_peak = broker_queue.spike_count;
+#endif
     broker_queue.cmd_peak = broker_queue.cmd_count;
 }
 
 uint8_t z1_broker_queue_depth(void) {
+#if Z1_BROKER_SPIKE_QUEUE_DEPTH > 0
     return broker_queue.spike_count + broker_queue.cmd_count;
+#else
+    return broker_queue.cmd_count;
+#endif
 }
 
 uint32_t z1_broker_get_spike_queue_depth(void) {
+#if Z1_BROKER_SPIKE_QUEUE_DEPTH > 0
     return broker_queue.spike_count;
+#else
+    return 0;
+#endif
 }
 
 uint32_t z1_broker_get_cmd_queue_depth(void) {
@@ -461,5 +553,10 @@ bool z1_broker_send_legacy_command(uint8_t dest, uint8_t cmd,
 }
 
 bool z1_broker_try_receive(z1_frame_t *frame) {
-    return z1_bus_try_receive_frame(frame);
+    bool received = z1_bus_try_receive_frame(frame);
+    if (received) {
+        printf("[BROKER] RX: type=%d src=%d dest=%d len=%d\n", 
+               frame->type, frame->src, frame->dest, frame->length);
+    }
+    return received;
 }

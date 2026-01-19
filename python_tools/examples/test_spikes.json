@@ -1,0 +1,6 @@
+﻿{
+  "spikes": [
+    {"neuron_id": 0, "count": 1250},
+    {"neuron_id": 1, "count": 1250}
+  ]
+}

@@ -1,5 +1,6 @@
 /**
  * Z1 Onyx Bus - Public API Header
+ * Code by NeuroFab Corp: 2025-2026
  */
 
 #ifndef Z1_BUS_H
@@ -38,6 +39,26 @@
 #define Z1_OPCODE_PING          0x0002  // Topology ping request
 #define Z1_OPCODE_PING_REPLY    0x0003  // Ping reply
 #define Z1_OPCODE_TOPOLOGY      0x0004  // Topology broadcast
+
+/**
+ * Over-The-Air (OTA) firmware update opcodes
+ * Controller-driven update protocol for node firmware updates
+ */
+#define Z1_OPCODE_UPDATE_MODE_ENTER     0x0080  // Enter update mode (broadcast)
+#define Z1_OPCODE_UPDATE_MODE_EXIT      0x0081  // Exit update mode (broadcast)
+#define Z1_OPCODE_UPDATE_START          0x0082  // Start update session (targeted)
+#define Z1_OPCODE_UPDATE_DATA_CHUNK     0x0083  // Firmware data chunk (targeted)
+#define Z1_OPCODE_UPDATE_VERIFY_REQ     0x0084  // Request CRC32 verification (poll)
+#define Z1_OPCODE_UPDATE_COMMIT         0x0085  // Commit firmware to flash (broadcast)
+#define Z1_OPCODE_UPDATE_RESTART        0x0086  // Restart with new firmware (broadcast)
+#define Z1_OPCODE_UPDATE_POLL           0x0087  // Poll node for status (broadcast with node ID)
+
+// Node response opcodes (only sent when polled)
+#define Z1_OPCODE_UPDATE_READY          0x0088  // Node ready for update
+#define Z1_OPCODE_UPDATE_ACK_CHUNK      0x0089  // Chunk received acknowledgment
+#define Z1_OPCODE_UPDATE_VERIFY_RESP    0x008A  // CRC32 verification response
+#define Z1_OPCODE_UPDATE_COMMIT_RESP    0x008B  // Flash commit response
+#define Z1_OPCODE_UPDATE_ERROR          0x008F  // Update error response
 
 /**
  * Received frame structure
@@ -90,6 +111,148 @@ typedef struct {
     uint8_t online_count;                   // Number of online nodes
     uint32_t last_update_ms;                // Time of last topology update
 } z1_topology_t;
+
+/**
+ * =============================================================================
+ * OTA Firmware Update Protocol Structures
+ * =============================================================================
+ */
+
+/**
+ * UPDATE_MODE_ENTER - Broadcast command to enter update mode
+ * All nodes stop SNN processing and prepare to receive firmware
+ */
+typedef struct {
+    uint16_t opcode;            // Z1_OPCODE_UPDATE_MODE_ENTER (0x0080)
+    uint16_t reserved[3];       // Reserved for future use
+} __attribute__((packed)) z1_update_mode_enter_t;
+
+/**
+ * UPDATE_MODE_EXIT - Broadcast command to exit update mode
+ * Nodes return to normal operation without restarting
+ */
+typedef struct {
+    uint16_t opcode;            // Z1_OPCODE_UPDATE_MODE_EXIT (0x0081)
+    uint16_t reserved[3];       // Reserved for future use
+} __attribute__((packed)) z1_update_mode_exit_t;
+
+/**
+ * UPDATE_START - Targeted command to begin firmware transfer to specific node
+ * Node allocates PSRAM buffer and prepares to receive chunks
+ */
+typedef struct {
+    uint16_t opcode;            // Z1_OPCODE_UPDATE_START (0x0082)
+    uint8_t target_node_id;     // Target node ID (0-15)
+    uint8_t reserved_byte;
+    uint32_t total_size;        // Firmware binary size in bytes
+    uint32_t expected_crc32;    // Expected CRC32 of complete binary
+    uint16_t chunk_size;        // Size of each chunk in bytes (typically 4096)
+    uint16_t total_chunks;      // Total number of chunks to expect
+} __attribute__((packed)) z1_update_start_t;
+
+/**
+ * UPDATE_DATA_CHUNK - Firmware data chunk sent to specific node
+ * Sent at maximum rate (target 8-10 MB/s) to PSRAM buffer
+ * 
+ * NOTE: Chunk data stored in z1_frame_t payload[], not in this struct
+ * This struct is the header, followed by variable-length chunk data
+ */
+typedef struct {
+    uint16_t opcode;            // Z1_OPCODE_UPDATE_DATA_CHUNK (0x0083)
+    uint8_t target_node_id;     // Target node ID (0-15)
+    uint8_t reserved_byte;
+    uint16_t chunk_num;         // Sequential chunk number (0-based)
+    uint16_t data_size;         // Actual data size in this chunk (bytes)
+    // Chunk data follows in frame payload (max 1192 bytes after 8-byte header)
+} __attribute__((packed)) z1_update_data_chunk_t;
+
+/**
+ * UPDATE_POLL - Broadcast with embedded node ID for selective response
+ * Only the specified node may respond to this poll
+ */
+typedef struct {
+    uint16_t opcode;            // Z1_OPCODE_UPDATE_POLL (0x0087)
+    uint8_t poll_node_id;       // Only this node should respond
+    uint8_t poll_type;          // Type of poll (status, verify, commit)
+    uint16_t reserved[2];
+} __attribute__((packed)) z1_update_poll_t;
+
+// Poll types for UPDATE_POLL
+#define Z1_POLL_TYPE_STATUS     0x01  // Request general status
+#define Z1_POLL_TYPE_VERIFY     0x02  // Request CRC32 verification
+#define Z1_POLL_TYPE_COMMIT     0x03  // Request commit status
+
+/**
+ * UPDATE_READY - Node response: ready to receive firmware
+ */
+typedef struct {
+    uint16_t opcode;            // Z1_OPCODE_UPDATE_READY (0x0088)
+    uint8_t node_id;            // Responding node ID
+    uint8_t status;             // 0=ready, 1=busy, 2=error
+    uint32_t available_psram;   // Available PSRAM in bytes
+} __attribute__((packed)) z1_update_ready_t;
+
+/**
+ * UPDATE_VERIFY_RESP - Node response: CRC32 verification result
+ */
+typedef struct {
+    uint16_t opcode;            // Z1_OPCODE_UPDATE_VERIFY_RESP (0x008A)
+    uint8_t node_id;            // Responding node ID
+    uint8_t status;             // 0=OK, 1=CRC_FAIL, 2=TIMEOUT, 3=ERROR
+    uint32_t calculated_crc32;  // CRC32 calculated by node
+    uint16_t chunks_received;   // Number of chunks received
+    uint16_t chunks_missing;    // Number of chunks still missing
+} __attribute__((packed)) z1_update_verify_resp_t;
+
+/**
+ * UPDATE_COMMIT - Broadcast command to flash firmware from PSRAM
+ * Nodes verify CRC32, program flash, verify flash contents
+ */
+typedef struct {
+    uint16_t opcode;            // Z1_OPCODE_UPDATE_COMMIT (0x0085)
+    uint16_t reserved[3];
+} __attribute__((packed)) z1_update_commit_t;
+
+/**
+ * UPDATE_COMMIT_RESP - Node response: flash programming result
+ */
+typedef struct {
+    uint16_t opcode;            // Z1_OPCODE_UPDATE_COMMIT_RESP (0x008B)
+    uint8_t node_id;            // Responding node ID
+    uint8_t flash_status;       // 0=SUCCESS, 1=VERIFY_FAIL, 2=WRITE_FAIL, 3=CRC_FAIL
+    uint32_t flash_crc32;       // CRC32 of data written to flash
+} __attribute__((packed)) z1_update_commit_resp_t;
+
+/**
+ * UPDATE_RESTART - Broadcast command to reboot all nodes
+ * Nodes perform watchdog reset to boot new firmware
+ */
+typedef struct {
+    uint16_t opcode;            // Z1_OPCODE_UPDATE_RESTART (0x0086)
+    uint16_t delay_ms;          // Delay before restart (milliseconds)
+    uint16_t reserved[2];
+} __attribute__((packed)) z1_update_restart_t;
+
+/**
+ * UPDATE_ERROR - Node response: error during update process
+ */
+typedef struct {
+    uint16_t opcode;            // Z1_OPCODE_UPDATE_ERROR (0x008F)
+    uint8_t node_id;            // Responding node ID
+    uint8_t error_code;         // Error code (see below)
+    uint16_t error_data;        // Additional error information
+    uint16_t reserved;
+} __attribute__((packed)) z1_update_error_t;
+
+// Error codes for UPDATE_ERROR
+#define Z1_UPDATE_ERR_PSRAM_ALLOC_FAIL  0x01  // PSRAM allocation failed
+#define Z1_UPDATE_ERR_CHUNK_OUT_OF_SEQ  0x02  // Chunk received out of sequence
+#define Z1_UPDATE_ERR_CRC32_MISMATCH    0x03  // CRC32 verification failed
+#define Z1_UPDATE_ERR_FLASH_ERASE_FAIL  0x04  // Flash erase failed
+#define Z1_UPDATE_ERR_FLASH_WRITE_FAIL  0x05  // Flash write failed
+#define Z1_UPDATE_ERR_FLASH_VERIFY_FAIL 0x06  // Flash verification failed
+#define Z1_UPDATE_ERR_TIMEOUT           0x07  // Operation timeout
+#define Z1_UPDATE_ERR_INVALID_STATE     0x08  // Invalid state for operation
 
 /**
  * Initialize bus as controller (ID 16)

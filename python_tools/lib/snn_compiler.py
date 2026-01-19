@@ -33,6 +33,7 @@ class NeuronConfig:
 class DeploymentPlan:
     """Plan for deploying SNN across cluster."""
     neuron_tables: Dict[Tuple[str, int], bytes]  # (backplane_id, node_id) -> table_data
+    neuron_counts: Dict[Tuple[str, int], int]    # (backplane_id, node_id) -> actual neuron count (excludes end marker)
     neuron_map: Dict[int, Tuple[str, int, int]]  # global_id -> (backplane, node, local_id)
     backplane_nodes: Dict[str, List[int]]        # backplane_id -> list of node_ids
     total_neurons: int
@@ -56,6 +57,7 @@ class SNNCompiler:
         self.node_assignments = {}  # (backplane_id, node_id) -> [global_neuron_ids]
         self.layer_map = {}
         self.neuron_map = {}  # global_id -> (backplane, node, local_id)
+        self.sequential_to_encoded = {}  # sequential_id -> encoded_id
         
     def compile(self) -> DeploymentPlan:
         """
@@ -74,10 +76,10 @@ class SNNCompiler:
         self._generate_connections()
         
         # Step 4: Compile neuron tables
-        neuron_tables = self._compile_neuron_tables()
+        neuron_tables, neuron_counts = self._compile_neuron_tables()
         
         # Step 5: Build deployment plan
-        deployment_plan = self._build_deployment_plan(neuron_tables)
+        deployment_plan = self._build_deployment_plan(neuron_tables, neuron_counts)
         
         return deployment_plan
     
@@ -171,9 +173,16 @@ class SNNCompiler:
                 # Find which node this neuron is assigned to
                 bp_name, node_id, local_id = self._find_node_for_neuron(global_id)
                 
+                # Encode global neuron ID: (node_id << 16) | local_id
+                # This matches the C firmware's encode_global_neuron_id() format
+                encoded_global_id = (node_id << 16) | local_id
+                
+                # Store mapping from sequential ID to encoded ID for synapses
+                self.sequential_to_encoded[global_id] = encoded_global_id
+                
                 neuron = NeuronConfig(
                     neuron_id=local_id,
-                    global_id=global_id,
+                    global_id=encoded_global_id,
                     node_id=node_id,
                     backplane_id=bp_name,
                     flags=flags,
@@ -184,8 +193,8 @@ class SNNCompiler:
                 )
                 
                 self.neurons.append(neuron)
-                self.layer_map[global_id] = layer_id
-                self.neuron_map[global_id] = (bp_name, node_id, local_id)
+                self.layer_map[encoded_global_id] = layer_id
+                self.neuron_map[encoded_global_id] = (bp_name, node_id, local_id)
     
     def _find_node_for_neuron(self, global_id: int) -> Tuple[str, int, int]:
         """
@@ -242,14 +251,18 @@ class SNNCompiler:
     
     def _add_explicit_connection(self, conn_config: Dict[str, Any]):
         """Add an explicit neuron-to-neuron connection."""
-        source_id = conn_config['source_neuron']
-        target_id = conn_config['target_neuron']
+        source_id_seq = conn_config['source_neuron']
+        target_id_seq = conn_config['target_neuron']
         weight_float = conn_config.get('weight', 0.5)
         
-        # Find target neuron
+        # Convert sequential IDs to encoded IDs
+        source_id = self.sequential_to_encoded.get(source_id_seq, source_id_seq)
+        target_id = self.sequential_to_encoded.get(target_id_seq, target_id_seq)
+        
+        # Find target neuron by encoded ID
         target_neuron = next((n for n in self.neurons if n.global_id == target_id), None)
         if not target_neuron:
-            print(f"Warning: Target neuron {target_id} not found")
+            print(f"Warning: Target neuron {target_id_seq} (encoded {target_id}) not found")
             return
         
         # Convert weight to 8-bit integer
@@ -276,10 +289,15 @@ class SNNCompiler:
         weight_mean = conn_config.get('weight_mean', 0.5)
         weight_stddev = conn_config.get('weight_stddev', 0.1)
         
-        for target_id in range(target_start, target_end + 1):
+        for target_id_seq in range(target_start, target_end + 1):
+            # Convert sequential ID to encoded ID
+            target_id = self.sequential_to_encoded.get(target_id_seq, target_id_seq)
             target_neuron = next(n for n in self.neurons if n.global_id == target_id)
             
-            for source_id in range(source_start, source_end + 1):
+            for source_id_seq in range(source_start, source_end + 1):
+                # Convert sequential ID to encoded ID for synapse
+                source_id = self.sequential_to_encoded.get(source_id_seq, source_id_seq)
+                
                 # Generate weight
                 if weight_init == 'random_normal':
                     weight_float = random.gauss(weight_mean, weight_stddev)
@@ -315,10 +333,15 @@ class SNNCompiler:
             weight_stddev = conn_config.get('weight_stddev', 0.1)
             use_range = False
         
-        for target_id in range(target_start, target_end + 1):
+        for target_id_seq in range(target_start, target_end + 1):
+            # Convert sequential ID to encoded ID
+            target_id = self.sequential_to_encoded.get(target_id_seq, target_id_seq)
             target_neuron = next(n for n in self.neurons if n.global_id == target_id)
             
-            for source_id in range(source_start, source_end + 1):
+            for source_id_seq in range(source_start, source_end + 1):
+                # Convert sequential ID to encoded ID for synapse
+                source_id = self.sequential_to_encoded.get(source_id_seq, source_id_seq)
+                
                 if random.random() < connection_prob:
                     # Generate weight
                     if use_range:
@@ -334,9 +357,14 @@ class SNNCompiler:
                     if len(target_neuron.synapses) < 54:
                         target_neuron.synapses.append((source_id, weight))
     
-    def _compile_neuron_tables(self) -> Dict[Tuple[str, int], bytes]:
-        """Compile neuron tables for each node."""
+    def _compile_neuron_tables(self) -> Tuple[Dict[Tuple[str, int], bytes], Dict[Tuple[str, int], int]]:
+        """Compile neuron tables for each node.
+        
+        Returns:
+            (neuron_tables, neuron_counts) where neuron_counts is the actual neuron count (excludes end marker)
+        """
         neuron_tables = {}
+        neuron_counts = {}
         
         for (bp_name, node_id), neuron_ids in self.node_assignments.items():
             table_data = bytearray()
@@ -346,7 +374,9 @@ class SNNCompiler:
                           if n.backplane_id == bp_name and n.node_id == node_id]
             node_neurons.sort(key=lambda n: n.neuron_id)
             
-            print(f"[COMPILER DEBUG] Node {node_id}: {len(node_neurons)} neurons")
+            actual_neuron_count = len(node_neurons)  # Store actual count before adding end marker
+            
+            print(f"[COMPILER DEBUG] Node {node_id}: {actual_neuron_count} neurons")
             for neuron in node_neurons:
                 # Pack neuron entry (256 bytes)
                 entry = self._pack_neuron_entry(neuron)
@@ -364,8 +394,9 @@ class SNNCompiler:
             table_data.extend(end_marker)
             
             neuron_tables[(bp_name, node_id)] = bytes(table_data)
+            neuron_counts[(bp_name, node_id)] = actual_neuron_count
         
-        return neuron_tables
+        return neuron_tables, neuron_counts
     
     def _pack_neuron_entry(self, neuron: NeuronConfig) -> bytes:
         """Pack neuron entry into 256-byte binary format."""
@@ -394,21 +425,15 @@ class SNNCompiler:
         
         # Synapses (240 bytes, 60 × 4 bytes)
         for i, (source_global_id, weight) in enumerate(neuron.synapses[:60]):
-            # Convert global ID to encoded format: (node_id << 16) | local_neuron_id
-            if source_global_id in self.neuron_map:
-                source_bp, source_node, source_local = self.neuron_map[source_global_id]
-                source_encoded = (source_node << 16) | source_local
-            else:
-                # Fallback: use global ID as-is
-                source_encoded = source_global_id
-            
+            # source_global_id is already encoded as (node_id << 16) | local_id
             # Pack synapse: [source_id:24][weight:8]
-            synapse_value = ((source_encoded & 0xFFFFFF) << 8) | (weight & 0xFF)
+            synapse_value = ((source_global_id & 0xFFFFFF) << 8) | (weight & 0xFF)
             struct.pack_into('<I', entry, 40 + i * 4, synapse_value)
         
         return bytes(entry)
     
-    def _build_deployment_plan(self, neuron_tables: Dict[Tuple[str, int], bytes]) -> DeploymentPlan:
+    def _build_deployment_plan(self, neuron_tables: Dict[Tuple[str, int], bytes], 
+                               neuron_counts: Dict[Tuple[str, int], int]) -> DeploymentPlan:
         """Build deployment plan from compiled neuron tables."""
         # Group nodes by backplane
         backplane_nodes = {}
@@ -426,6 +451,7 @@ class SNNCompiler:
         
         return DeploymentPlan(
             neuron_tables=neuron_tables,
+            neuron_counts=neuron_counts,
             neuron_map=self.neuron_map,
             backplane_nodes=backplane_nodes,
             total_neurons=len(self.neurons),

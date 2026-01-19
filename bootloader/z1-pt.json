@@ -1,0 +1,36 @@
+{
+  "version": [1, 0],
+  "unpartitioned": {
+    "families": ["absolute"],
+    "permissions": {
+      "secure": "rw",
+      "nonsecure": "rw",
+      "bootloader": "rw"
+    }
+  },
+  "partitions": [
+    {
+      "name": "bootloader",
+      "id": 0,
+      "start": "0",
+      "size": "0x80000",
+      "permissions": {
+        "secure": "rw",
+        "nonsecure": "rw",
+        "bootloader": "rw"
+      },
+      "families": ["absolute"]
+    },
+    {
+      "name": "app",
+      "id": 1,
+      "start": "0x80000",
+      "size": "0x780000",
+      "permissions": {
+        "nonsecure": "rw",
+        "bootloader": "rw"
+      },
+      "families": ["rp2350-arm-s"]
+    }
+  ]
+}

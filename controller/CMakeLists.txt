@@ -4,7 +4,10 @@ if(BUILD_HW_V2)
         controller_main.c
         w5500_eth.c
         z1_http_api.c
+        hw_config.c
         ../common/core_queue/core_queue.c
+        ../common/sd_card/sd_card.c
+        ../common/sd_card/z1_config.c
     )
 
     # Set board to Pico 2 (RP2350)
@@ -17,19 +20,27 @@ if(BUILD_HW_V2)
         PICO_STACK_SIZE=0x1000  # 4KB stack per core
     )
 
+    # Include sd_card wrapper headers AND hardware_rtc manually (SDK bug workaround)
+    target_include_directories(controller_16 PRIVATE
+        ../common/sd_card
+        ${PICO_SDK_PATH}/src/rp2_common/hardware_rtc/include
+    )
+
     target_link_libraries(controller_16
         pico_stdlib
         pico_multicore
         hardware_pio
         hardware_dma
         hardware_gpio
+        hardware_pwm
         hardware_spi
+        hardware_clocks
         hardware_vreg
         z1_onyx_bus
         z1_broker
         psram
         oled
-        sd_card_stub
+        FatFs_SPI  # INTERFACE library - compiles FatFS sources with proper dependencies
     )
 
     # Enable USB output
@@ -46,7 +57,10 @@ if(BUILD_HW_V1)
         controller_main.c
         w5500_eth.c
         z1_http_api.c
+        hw_config.c
         ../common/core_queue/core_queue.c
+        ../common/sd_card/sd_card.c
+        ../common/sd_card/z1_config.c
     )
 
     # Set board to Pico 2 (RP2350)
@@ -59,18 +73,26 @@ if(BUILD_HW_V1)
         PICO_STACK_SIZE=0x1000  # 4KB stack per core
     )
 
+    # Include sd_card wrapper headers AND hardware_rtc manually (SDK bug workaround)
+    target_include_directories(controller_12 PRIVATE
+        ../common/sd_card
+        ${PICO_SDK_PATH}/src/rp2_common/hardware_rtc/include
+    )
+
     target_link_libraries(controller_12
         pico_stdlib
         pico_multicore
         hardware_pio
         hardware_dma
         hardware_gpio
+        hardware_pwm
         hardware_spi
+        hardware_clocks
         hardware_vreg
         z1_onyx_bus
         z1_broker
         psram
-        sd_card_stub  # No OLED on V1
+        FatFs_SPI  # INTERFACE library - compiles FatFS sources with proper dependencies (no OLED on V1)
     )
 
     # Enable USB output

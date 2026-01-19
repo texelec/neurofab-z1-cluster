@@ -1,0 +1,134 @@
+{
+  "package_format_version": "1.0",
+  "app_info": {
+    "name": "LIF_SNN_Engine",
+    "display_name": "Leaky Integrate-and-Fire SNN Engine",
+    "version": "1.0.0",
+    "description": "LIF neuron model with STDP learning - works with any topology (XOR, MNIST, etc.)",
+    "author": "NeuroFab Z1 Team",
+    "build_date": "2026-01-06",
+    "platform": "Z1_Onyx_RP2350",
+    "min_bootloader_version": "1.0.0",
+    "engine_type": "lif",
+    "neuron_model": "Leaky Integrate-and-Fire with exponential leak",
+    "learning_algorithms": ["STDP", "weight_normalization"],
+    "compatible_topologies": ["xor", "mnist", "generic_feedforward", "recurrent"]
+  },
+  "binary_info": {
+    "entry_point_offset": 160,
+    "text_size": 50464,
+    "data_size": 0,
+    "bss_size": 218376,
+    "total_flash_usage": 51200,
+    "total_ram_usage": 218376,
+    "estimated_psram_usage": 1048576,
+    "max_neurons": 16,
+    "max_synapses": 60
+  },
+  "topology": {
+    "note": "Topology is NOT part of this package - deployed separately at runtime",
+    "deployment_mechanism": "Controller sends JSON → WRITE_MEMORY → PSRAM → DEPLOY_TOPOLOGY",
+    "example_topologies": [
+      "xor_working.json (5 neurons, 6 connections)",
+      "mnist_snn.json (794 neurons, ~50K connections)",
+      "custom topology via API"
+    ],
+    "supports_stdp": true,
+    "max_neurons_per_node": 16,
+    "max_synapses_per_neuron": 60
+  },
+  "dependencies": {
+    "bootloader_apis": [
+      "z1_broker_send_command",
+      "z1_broker_task",
+      "z1_broker_try_receive",
+      "z1_bus_send_frame",
+      "z1_bus_get_node_id",
+      "psram_read",
+      "psram_write"
+    ],
+    "shared_memory": {
+      "psram_neuron_table": "0x00100000",
+      "psram_working_memory": "0x00700000"
+    }
+  },
+  "application_files": {
+    "source_code": [
+      "../../node/z1_snn_engine.c",
+      "../../node/z1_snn_engine.h",
+      "app_main.c",
+      "app_header.h"
+    ],
+    "topology_data": [
+      "../../python_tools/examples/xor_working.json",
+      "../../python_tools/examples/xor_input_00.json",
+      "../../python_tools/examples/xor_input_01.json",
+      "../../python_tools/examples/xor_input_10.json",
+      "../../python_tools/examples/xor_input_11.json"
+    ],
+    "binary_output": "xor_snn_app.elf"
+  },
+  "bootloader_interface": {
+    "required_functions": [
+      {
+        "name": "app_init",
+        "description": "Called by bootloader after jump to app",
+        "signature": "void app_init(void)"
+      },
+      {
+        "name": "app_main_loop",
+        "description": "Main application loop (called repeatedly by bootloader)",
+        "signature": "void app_main_loop(void)"
+      },
+      {
+        "name": "app_handle_command",
+        "description": "Handle commands from controller via bootloader",
+        "signature": "void app_handle_command(z1_frame_t* frame)"
+      }
+    ],
+    "provided_callbacks": [
+      {
+        "name": "on_spike_received",
+        "description": "Called when spike arrives from Matrix bus"
+      },
+      {
+        "name": "on_topology_deployed",
+        "description": "Called after controller deploys neuron topology"
+      }
+    ]
+  },
+  "flash_layout": {
+    "partition_id": 1,
+    "flash_offset": "0x00200000",
+    "max_size": 6291456,
+    "alignment": 4096
+  },
+  "test_vectors": {
+    "xor_00": {
+      "inputs": [0, 0],
+      "expected_output": 0,
+      "description": "0 XOR 0 = 0"
+    },
+    "xor_01": {
+      "inputs": [0, 1],
+      "expected_output": 1,
+      "description": "0 XOR 1 = 1"
+    },
+    "xor_10": {
+      "inputs": [1, 0],
+      "expected_output": 1,
+      "description": "1 XOR 0 = 1"
+    },
+    "xor_11": {
+      "inputs": [1, 1],
+      "expected_output": 0,
+      "description": "1 XOR 1 = 0"
+    }
+  },
+  "deployment_notes": {
+    "nodes_required": 2,
+    "network_load_time_ms": 10,
+    "typical_inference_time_us": 5000,
+    "power_consumption_mw": 250
+  }
+}

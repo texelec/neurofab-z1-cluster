@@ -1,0 +1,131 @@
+#!/usr/bin/env python3
+"""
+nreset - Reset Z1 cluster nodes into bootloader mode
+
+Supports both hardware reset (V2 only) and software reset (V1/V2).
+Useful for preparing nodes for OTA firmware updates.
+"""
+
+import sys
+import os
+import argparse
+import requests
+
+# Add lib directory to path
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'lib'))
+
+from z1_client import Z1Client, Z1ClusterError
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description='Reset Z1 cluster nodes into bootloader mode',
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  # Reset all nodes (software reset, default)
+  nreset -c 192.168.1.222
+  
+  # Reset specific node only (for individual OTA testing)
+  nreset -c 192.168.1.222 -n 0
+  nreset -c 192.168.1.222 -n 1
+  
+  # Reset controller itself
+  nreset -c 192.168.1.222 -n 16
+  
+  # Force hardware reset - resets ALL nodes (V2 only)
+  nreset -c 192.168.1.222 --hardware
+        """
+    )
+    
+    parser.add_argument('-c', '--controller', 
+                       default='192.168.1.222',
+                       help='Controller IP address (default: 192.168.1.222)')
+    
+    parser.add_argument('--software', action='store_true',
+                       help='Force software reset (watchdog reboot)')
+    
+    parser.add_argument('--hardware', action='store_true',
+                       help='Force hardware reset (GPIO pin, V2 only, resets ALL nodes)')
+    
+    parser.add_argument('-n', '--node', type=int,
+                       help='Reset specific node (0-15) or controller (16)')
+    
+    parser.add_argument('-v', '--verbose', action='store_true',
+                       help='Verbose output')
+    
+    args = parser.parse_args()
+    
+    # Check for conflicting options
+    if args.software and args.hardware:
+        print("Error: Cannot specify both --software and --hardware", file=sys.stderr)
+        return 1
+    
+    if args.hardware and args.node is not None:
+        print("Error: Hardware reset cannot target specific node (resets all nodes)", file=sys.stderr)
+        return 1
+    
+    if args.node is not None and (args.node < 0 or args.node > 16):
+        print(f"Error: Invalid node ID {args.node} (valid: 0-15 for nodes, 16 for controller)", file=sys.stderr)
+        return 1
+    
+    # Build query string
+    mode_param = ""
+    if args.hardware:
+        mode_param = "?mode=hardware"
+        reset_method = "hardware (GPIO, all nodes)"
+    elif args.node is not None:
+        mode_param = f"?node={args.node}"
+        if args.node == 16:
+            reset_method = "software (controller only)"
+        else:
+            reset_method = f"software (node {args.node} only)"
+    elif args.software:
+        mode_param = "?mode=software"
+        reset_method = "software (all nodes)"
+    else:
+        reset_method = "software (default, all nodes)"
+    
+    # Send reset command
+    url = f"http://{args.controller}/api/nodes/reset{mode_param}"
+    
+    print(f"Resetting cluster nodes via {reset_method}...")
+    print(f"Controller: {args.controller}")
+    
+    try:
+        response = requests.post(url, timeout=5)
+        
+        if response.status_code == 200:
+            data = response.json()
+            status = data.get('status', 'unknown')
+            method = data.get('method', 'unknown')
+            
+            if status == 'ok':
+                print(f"✓ Reset : {method}")
+                nodes_affected = data.get('nodes', 'unknown')
+                print(f"  Nodes: {nodes_affected}")
+                print(f"\nNode(s)d used: {method}")
+                print(f"\nNodes will reboot into bootloader mode.")
+                print(f"Bootloader will wait 5 seconds before launching application.")
+                print(f"Use OTA tools during this window to update firmware.")
+                return 0
+            else:
+                print(f"✗ Reset failed: {data}", file=sys.stderr)
+                return 1
+        else:
+            print(f"✗ HTTP error {response.status_code}: {response.text}", file=sys.stderr)
+            return 1
+            
+    except requests.exceptions.Timeout:
+        print("✗ Request timed out (controller may be unreachable)", file=sys.stderr)
+        return 1
+    except requests.exceptions.ConnectionError:
+        print(f"✗ Cannot connect to controller at {args.controller}", file=sys.stderr)
+        return 1
+    except Exception as e:
+        print(f"✗ Error: {e}", file=sys.stderr)
+        return 1
+
+
+if __name__ == '__main__':
+    sys.exit(main())

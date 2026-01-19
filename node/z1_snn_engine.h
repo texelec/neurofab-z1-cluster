@@ -1,5 +1,6 @@
 /**
  * Z1 Neuromorphic Compute Node - SNN Execution Engine
+ * Code by NeuroFab Corp: 2025-2026
  * 
  * Implements Leaky Integrate-and-Fire (LIF) neuron model with spike processing
  * for distributed spiking neural network execution on RP2350B nodes.
@@ -19,6 +20,9 @@
 
 #include <stdint.h>
 #include <stdbool.h>
+#include "../z1_broker/z1_broker.h"
+#include <stdbool.h>
+#include "../z1_broker/z1_broker.h"
 
 // ============================================================================
 // Configuration
@@ -28,9 +32,9 @@
 #define Z1_SNN_MAX_SYNAPSES     60    // Maximum synapses per neuron
 #define Z1_SNN_MAX_SPIKE_QUEUE  256   // Spike queue size
 
-// PSRAM addresses
-#define Z1_SNN_PSRAM_BASE           0x00000000  // PSRAM offset (not CPU address)
-#define Z1_SNN_NEURON_TABLE_ADDR    0x00100000  // 1MB offset for neuron table
+// PSRAM addresses (absolute uncached addresses for new PSRAM API)
+#define Z1_SNN_PSRAM_BASE           0x15000000  // PSRAM uncached base (was 0x00000000 offset)
+#define Z1_SNN_NEURON_TABLE_ADDR    0x15100000  // PSRAM base + 1MB offset (was 0x00100000)
 #define Z1_NEURON_ENTRY_SIZE        256         // Bytes per neuron entry
 
 // Neuron flags (matches reference_github format)
@@ -164,6 +168,7 @@ typedef struct {
     uint8_t node_id;                                       // This node's ID
     bool initialized;                                      // Engine initialized
     bool running;                                          // Simulation running
+    bool paused;                                           // Paused for stats collection
     
     uint16_t neuron_count;                                 // Number of neurons loaded
     uint32_t current_time_us;                              // Current simulation time
@@ -214,6 +219,16 @@ void z1_snn_start(void);
 void z1_snn_stop(void);
 
 /**
+ * Pause SNN execution (freezes timestep timer, keeps all state)
+ */
+void z1_snn_pause(void);
+
+/**
+ * Resume SNN execution from pause
+ */
+void z1_snn_resume(void);
+
+/**
  * Execute single timestep
  * 
  * CRITICAL ALGORITHM (from reference_github, WORKING implementation):
@@ -228,7 +243,23 @@ void z1_snn_stop(void);
 void z1_snn_step(void);
 
 /**
+ * Inject spike with immediate processing (for input neurons)
+ * 
+ * Directly adds value to membrane potential and checks threshold immediately.
+ * Use this for controller-injected input spikes that should fire within the
+ * same timestep. Matches Python reference implementation behavior.
+ * 
+ * @param local_neuron_id Local neuron ID on this node (0-based)
+ * @param value Spike value (typically 1.0)
+ * @return true if successful, false if invalid neuron ID
+ */
+bool z1_snn_inject_spike_immediate(uint16_t local_neuron_id, float value);
+
+/**
  * Inject spike into queue (from bus or local input)
+ * 
+ * Spike is queued and processed at start of next simulation step.
+ * Use this for spikes received from other nodes via Matrix bus.
  * 
  * @param spike Spike to inject
  * @return true if successful, false if queue full

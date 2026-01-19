@@ -1,5 +1,6 @@
 /**
  * Core Queue - Lock-Free Inter-Core FIFO
+ * Code by NeuroFab Corp: 2025-2026
  */
 
 #include "core_queue.h"
